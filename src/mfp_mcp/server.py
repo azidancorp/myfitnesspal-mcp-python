@@ -1207,6 +1207,88 @@ async def mfp_get_report(params: GetReportInput) -> str:
 
 
 # ============================================================================
+# Cookie Management Tool
+# ============================================================================
+
+
+@mcp.tool()
+def refresh_browser_cookies(browser: str = "chrome") -> str:
+    """
+    Extract and save session cookies from your web browser.
+    
+    Use this tool when authentication fails and you need to refresh your
+    MyFitnessPal session. You must be logged into myfitnesspal.com in your
+    browser for this to work.
+    
+    Args:
+        browser: Which browser to extract cookies from ("chrome" or "firefox")
+    
+    Returns:
+        Success message or error description
+    """
+    import browser_cookie3
+    
+    try:
+        # Get browser cookie function
+        if browser.lower() == "chrome":
+            cj = browser_cookie3.chrome(domain_name='.myfitnesspal.com')
+        elif browser.lower() == "firefox":
+            cj = browser_cookie3.firefox(domain_name='.myfitnesspal.com')
+        else:
+            return f"Unsupported browser: {browser}. Use 'chrome' or 'firefox'."
+        
+        # Extract cookies to dictionary
+        cookies = {c.name: c.value for c in cj}
+        
+        # Check for session token
+        if '__Secure-next-auth.session-token' not in cookies:
+            return (
+                f"No session token found in {browser}. "
+                "Please make sure you are logged into myfitnesspal.com in your browser, "
+                "then try again."
+            )
+        
+        # Save cookies
+        save_cookies(cookies)
+        
+        # Verify they work
+        try:
+            import myfitnesspal
+            cookiejar = dict_to_cookiejar(cookies)
+            client = myfitnesspal.Client(cookiejar=cookiejar)
+            _ = client.get_date(date.today())
+            
+            return (
+                f"Successfully extracted and verified {len(cookies)} cookies from {browser}. "
+                "Authentication is now working!"
+            )
+        except Exception as e:
+            return (
+                f"Cookies were extracted from {browser} but verification failed: {e}. "
+                "The session may have expired - try logging into myfitnesspal.com again."
+            )
+            
+    except Exception as e:
+        error_msg = str(e)
+        if "Operation not permitted" in error_msg:
+            return (
+                f"Permission denied reading {browser} cookies. "
+                "This can happen due to macOS security restrictions. "
+                "Try running this command in Terminal instead:\n\n"
+                f"{COOKIES_FILE.parent}/../venv/bin/python -c \""
+                "import browser_cookie3, json, os; "
+                "from datetime import datetime; "
+                f"cj = browser_cookie3.{browser}(domain_name='.myfitnesspal.com'); "
+                "cookies = {c.name: c.value for c in cj}; "
+                "os.makedirs(os.path.expanduser('~/.mfp_mcp'), exist_ok=True); "
+                "open(os.path.expanduser('~/.mfp_mcp/cookies.json'), 'w').write("
+                "json.dumps({'cookies': cookies, 'saved_at': datetime.now().isoformat()}, indent=2)); "
+                "print('Cookies refreshed!')\""
+            )
+        return f"Error extracting cookies from {browser}: {e}"
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
