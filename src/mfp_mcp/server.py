@@ -16,11 +16,12 @@ import logging
 import os
 import sys
 from datetime import date, datetime, timedelta
-from http.cookiejar import LWPCookieJar, Cookie
+from http.cookiejar import CookieJar, Cookie
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from enum import Enum
 from collections import OrderedDict
+import time
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -95,6 +96,44 @@ def load_cookies() -> Optional[Dict[str, str]]:
         return None
 
 
+def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal.com") -> CookieJar:
+    """
+    Convert a dictionary of cookies to a CookieJar that can be used by myfitnesspal.Client.
+    
+    Args:
+        cookies_dict: Dictionary of cookie name -> value
+        domain: Domain for the cookies (default: .myfitnesspal.com)
+    
+    Returns:
+        CookieJar: A CookieJar object populated with the cookies
+    """
+    jar = CookieJar()
+    
+    for name, value in cookies_dict.items():
+        cookie = Cookie(
+            version=0,
+            name=name,
+            value=value,
+            port=None,
+            port_specified=False,
+            domain=domain,
+            domain_specified=True,
+            domain_initial_dot=domain.startswith('.'),
+            path="/",
+            path_specified=True,
+            secure=True,
+            expires=int(time.time()) + 86400 * 30,  # 30 days from now
+            discard=False,
+            comment=None,
+            comment_url=None,
+            rest={"HttpOnly": None},
+            rfc2109=False,
+        )
+        jar.set_cookie(cookie)
+    
+    return jar
+
+
 def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
     """
     Authenticate with MyFitnessPal using username/password.
@@ -113,7 +152,6 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
     
     # MyFitnessPal login URL and endpoints
     LOGIN_URL = "https://www.myfitnesspal.com/account/login"
-    AUTH_URL = "https://www.myfitnesspal.com/api/auth/callback/credentials"
     
     try:
         with httpx.Client(follow_redirects=True, timeout=30.0) as client:
@@ -184,49 +222,60 @@ def get_mfp_client():
     """
     import myfitnesspal
     
+    last_error = None
+    
     # Method 1: Try environment variable credentials
     username = os.environ.get("MFP_USERNAME")
     password = os.environ.get("MFP_PASSWORD")
     
     if username and password:
         logger.info("Attempting authentication with environment credentials")
+        
+        # First check if we have valid stored cookies from a previous credential auth
+        stored_cookies = load_cookies()
+        if stored_cookies:
+            logger.info("Found stored session cookies, testing validity...")
+            try:
+                cookiejar = dict_to_cookiejar(stored_cookies)
+                client = myfitnesspal.Client(cookiejar=cookiejar)
+                # Test the connection
+                _ = client.get_date(date.today())
+                logger.info("Stored cookies are valid")
+                return client
+            except Exception as e:
+                logger.info(f"Stored cookies invalid: {e}, re-authenticating...")
+        
+        # Authenticate with credentials and save cookies
         try:
-            # First check if we have valid stored cookies
-            stored_cookies = load_cookies()
-            if stored_cookies:
-                logger.info("Found stored session cookies, testing validity...")
-                try:
-                    client = myfitnesspal.Client()
-                    # Test the connection
-                    _ = client.get_date(date.today())
-                    logger.info("Stored cookies are valid")
-                    return client
-                except Exception:
-                    logger.info("Stored cookies invalid, re-authenticating...")
-            
-            # Authenticate with credentials and save cookies
             cookies = authenticate_with_credentials(username, password)
             save_cookies(cookies)
             
-            # Now try to create client (it should pick up browser cookies)
-            client = myfitnesspal.Client()
+            # Create client with the new cookies
+            cookiejar = dict_to_cookiejar(cookies)
+            client = myfitnesspal.Client(cookiejar=cookiejar)
+            # Test the connection
+            _ = client.get_date(date.today())
+            logger.info("Successfully authenticated with credentials")
             return client
             
         except Exception as e:
+            last_error = e
             logger.warning(f"Credential authentication failed: {e}")
             # Fall through to other methods
     
-    # Method 2: Try stored session cookies
+    # Method 2: Try stored session cookies (without credential auth)
     stored_cookies = load_cookies()
     if stored_cookies:
         logger.info("Attempting authentication with stored cookies")
         try:
-            client = myfitnesspal.Client()
+            cookiejar = dict_to_cookiejar(stored_cookies)
+            client = myfitnesspal.Client(cookiejar=cookiejar)
             # Test the connection
             _ = client.get_date(date.today())
             logger.info("Successfully authenticated with stored cookies")
             return client
         except Exception as e:
+            last_error = e
             logger.warning(f"Stored cookie authentication failed: {e}")
     
     # Method 3: Try browser cookies (default behavior)
@@ -238,8 +287,9 @@ def get_mfp_client():
         logger.info("Successfully authenticated with browser cookies")
         return client
     except Exception as e:
+        last_error = e
         raise RuntimeError(
-            f"All authentication methods failed. Last error: {str(e)}\n\n"
+            f"All authentication methods failed. Last error: {str(last_error)}\n\n"
             "Please try one of these solutions:\n"
             "1. Set MFP_USERNAME and MFP_PASSWORD environment variables in Claude Desktop config\n"
             "2. Log into myfitnesspal.com in Chrome or Firefox\n"
