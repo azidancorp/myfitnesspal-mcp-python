@@ -19,7 +19,8 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 
 ## Prerequisites
 
-- **Python 3.10+**
+- **Python 3.10+** (check with `python3 --version`)
+- **pip 21.3+** (for pyproject.toml support; upgrade with `pip install --upgrade pip`)
 - **MyFitnessPal account**
 - **One of the following for authentication:**
   - Your MFP username/email and password (recommended), OR
@@ -36,25 +37,55 @@ This MCP supports multiple authentication methods:
 
 ## Installation
 
-### Option 1: Install from Source
+### Option 1: Install from Source (Recommended)
 
 ```bash
 # Clone the repository
 git clone https://github.com/yourusername/myfitnesspal-mcp-python.git
 cd myfitnesspal-mcp-python
 
-# Create and activate virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: .\venv\Scripts\activate
+# Create virtual environment (use python3.10+ on macOS/Linux)
+python3 -m venv venv
+# On macOS, you may need to specify version: python3.12 -m venv venv
 
-# Install the package
+# Activate virtual environment
+source venv/bin/activate  # macOS/Linux
+# On Windows: .\venv\Scripts\activate
+
+# Upgrade pip (required for pyproject.toml support)
+pip install --upgrade pip
+
+# Install the package in editable mode
 pip install -e .
 ```
 
-### Option 2: Install with pip
+### Option 2: Install with pip (when published)
 
 ```bash
 pip install mfp-mcp
+```
+
+> **Note**: Option 2 requires the package to be published to PyPI. For now, use Option 1.
+
+### Verify Installation
+
+After installation, verify the server can start:
+
+```bash
+# With venv activated
+python -m mfp_mcp.server
+```
+
+You should see the server waiting for input (it communicates via stdio). Press `Ctrl+C` to stop.
+
+To test authentication (optional):
+
+```bash
+MFP_USERNAME="your_email" MFP_PASSWORD="your_password" python -c "
+from mfp_mcp.server import get_mfp_client
+client = get_mfp_client()
+print('Authentication successful!')
+"
 ```
 
 ## Configuration for Claude Desktop
@@ -225,11 +256,12 @@ myfitnesspal-mcp-python/
 git clone https://github.com/yourusername/myfitnesspal-mcp-python.git
 cd myfitnesspal-mcp-python
 
-# Create virtual environment
-python -m venv venv
+# Create virtual environment (Python 3.10+ required)
+python3 -m venv venv
 source venv/bin/activate
 
-# Install with dev dependencies
+# Upgrade pip and install with dev dependencies
+pip install --upgrade pip
 pip install -e ".[dev]"
 ```
 
@@ -269,17 +301,38 @@ docker run -it --rm \
 
 ## Troubleshooting
 
-### "Failed to authenticate with MyFitnessPal"
+### "python: command not found" or wrong Python version
 
-**Problem**: The server can't read your browser cookies.
+**Problem**: Python is not in PATH or you need to specify version.
 
 **Solutions**:
-1. Make sure you're logged into myfitnesspal.com in Chrome or Firefox
-2. Try logging out and back in to MyFitnessPal
-3. Clear browser cookies and log in fresh
-4. On **macOS**, grant **Full Disk Access** to your terminal/IDE:
-   - System Preferences → Security & Privacy → Privacy → Full Disk Access
-   - Add Terminal.app or your IDE
+1. On macOS/Linux, use `python3` instead of `python`
+2. Check your version: `python3 --version` (must be 3.10+)
+3. If needed, install Python 3.12 via Homebrew: `brew install python@3.12`
+4. Then create venv with: `python3.12 -m venv venv`
+
+### "pip install -e ." fails with "setup.py not found"
+
+**Problem**: Your pip version is too old to support pyproject.toml builds.
+
+**Solution**: Upgrade pip first:
+```bash
+pip install --upgrade pip
+pip install -e .
+```
+
+### "Failed to authenticate with MyFitnessPal"
+
+**Problem**: The server can't authenticate with your credentials or read browser cookies.
+
+**Solutions**:
+1. **If using credentials**: Double-check your MFP_USERNAME and MFP_PASSWORD in the config
+2. **If using browser cookies**: Make sure you're logged into myfitnesspal.com in Chrome or Firefox
+3. Try logging out and back in to MyFitnessPal
+4. Clear browser cookies and log in fresh
+5. On **macOS**, grant **Full Disk Access** to Claude Desktop:
+   - System Settings → Privacy & Security → Full Disk Access
+   - Add Claude.app
 
 ### "No module named 'mfp_mcp'"
 
@@ -288,17 +341,23 @@ docker run -it --rm \
 **Solutions**:
 1. Ensure you're using the correct Python from your virtual environment
 2. Reinstall the package: `pip install -e .`
-3. Verify the path in your Claude Desktop config points to the venv Python
+3. Verify the path in your Claude Desktop config points to the venv Python:
+   ```
+   /path/to/project/venv/bin/python  # macOS/Linux
+   C:\path\to\project\venv\Scripts\python.exe  # Windows
+   ```
 
 ### Tools not appearing in Claude Desktop
 
 **Problem**: MCP server not connecting.
 
 **Solutions**:
-1. Check the config file syntax (valid JSON)
-2. Use absolute paths in the configuration
-3. Restart Claude Desktop completely (quit and relaunch)
-4. Check Claude Desktop logs for errors
+1. Check the config file syntax (must be valid JSON - use a JSON validator)
+2. Use **absolute paths** in the configuration (no `~` or relative paths)
+3. Restart Claude Desktop completely (Cmd+Q on macOS, then relaunch)
+4. Check Claude Desktop logs:
+   - macOS: `~/Library/Logs/Claude/`
+   - Windows: `%APPDATA%\Claude\logs\`
 
 ### Empty responses or no data
 
@@ -308,6 +367,20 @@ docker run -it --rm \
 1. Verify you have data logged in MyFitnessPal for the requested date
 2. Check the date format (YYYY-MM-DD)
 3. Try a recent date where you know you have entries
+
+### Double parentheses in terminal prompt like "((venv) )"
+
+**Problem**: VS Code/Cursor Python extension bug with venv prompt.
+
+**Solutions**:
+1. Update the Python extension in VS Code/Cursor
+2. Or manually fix the venv activate script - change line ~70 in `venv/bin/activate`:
+   ```bash
+   # Change from:
+   PS1="("'(venv) '") ${PS1:-}"
+   # To:
+   PS1="(venv) ${PS1:-}"
+   ```
 
 ## API Reference
 
@@ -369,9 +442,10 @@ Get nutrition report over a date range.
 
 ## Security & Privacy
 
-- **Browser Cookies**: This server reads your browser cookies to authenticate with MyFitnessPal. No credentials are stored by this server.
-- **Local Only**: The server runs locally on your machine via stdio transport.
-- **No External Transmission**: Your MyFitnessPal data is only transmitted between your computer and MyFitnessPal's servers.
+- **Credentials**: If using username/password authentication, credentials are stored in your Claude Desktop config file which is only readable by your user account. Session cookies are cached in `~/.mfp_mcp/cookies.json` for 30 days.
+- **Browser Cookies**: As a fallback, the server can read your browser cookies to authenticate with MyFitnessPal.
+- **Local Only**: The server runs locally on your machine via stdio transport. No data is sent to any third-party servers.
+- **No External Transmission**: Your MyFitnessPal data is only transmitted between your computer and MyFitnessPal's servers (myfitnesspal.com).
 
 ## License
 
