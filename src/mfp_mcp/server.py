@@ -148,7 +148,8 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
     Raises:
         RuntimeError: If authentication fails
     """
-    logger.info(f"Authenticating with credentials for user: {username}")
+    # Log authentication attempt without exposing the username
+    logger.info("Authenticating with credentials")
     
     # MyFitnessPal login URL and endpoints
     LOGIN_URL = "https://www.myfitnesspal.com/account/login"
@@ -773,14 +774,21 @@ def add_food_to_diary(
             raise RuntimeError(f"Failed to add food: HTTP {response.status_code}")
         
         # MyFitnessPal might return success even with errors in content
+        # Log error indication without exposing full response content (may contain sensitive data)
         content = response.text if hasattr(response, 'text') else response.content.decode('utf-8', errors='ignore')
         if 'error' in content.lower() and 'success' not in content.lower():
-            logger.warning(f"Possible error in response: {content[:200]}")
+            logger.warning("Possible error in response from MyFitnessPal API")
         
         logger.info(f"Successfully added food {mfp_id} to {meal} for {target_date}")
         
     except Exception as e:
-        raise RuntimeError(f"Failed to add food to diary: {e}")
+        # Don't expose internal error details to avoid leaking sensitive information
+        error_msg = str(e)
+        # Only include safe error information
+        if "HTTP" in error_msg or "status" in error_msg.lower():
+            raise RuntimeError(f"Failed to add food to diary: {error_msg}")
+        else:
+            raise RuntimeError("Failed to add food to diary. Please check your authentication and try again.")
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
@@ -846,7 +854,13 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
         logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
         
     except Exception as e:
-        raise RuntimeError(f"Failed to set water intake: {e}")
+        # Don't expose internal error details to avoid leaking sensitive information
+        error_msg = str(e)
+        # Only include safe error information
+        if "HTTP" in error_msg or "status" in error_msg.lower():
+            raise RuntimeError(f"Failed to set water intake: {error_msg}")
+        else:
+            raise RuntimeError("Failed to set water intake. Please check your authentication and try again.")
 
 
 # ============================================================================

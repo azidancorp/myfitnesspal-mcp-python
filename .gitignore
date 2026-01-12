@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# MyFitnessPal MCP - Session cookies (stored in ~/.mfp_mcp/ but adding here as safety)
+cookies.json
+.mfp_mcp/
+*.mfp_mcp
