@@ -9,13 +9,16 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_get_diary` | Read | Get food diary entries for any date |
 | `mfp_search_food` | Read | Search the MyFitnessPal food database |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
+| `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
 | `mfp_get_measurements` | Read | Get weight/body measurement history |
 | `mfp_set_measurement` | Write | Log a new weight or body measurement |
 | `mfp_get_exercises` | Read | Get logged exercises (cardio & strength) |
 | `mfp_get_goals` | Read | Get daily nutrition goals |
 | `mfp_set_goals` | Write | Update daily nutrition goals |
 | `mfp_get_water` | Read | Get water intake for a date |
+| `mfp_set_water` | Write | Log water intake for a date |
 | `mfp_get_report` | Read | Get nutrition reports over a date range |
+| `refresh_browser_cookies` | Utility | Extract and save session cookies from browser |
 
 ## Prerequisites
 
@@ -400,6 +403,18 @@ Get detailed nutrition for a food item.
 - `mfp_id` (required): MyFitnessPal food ID from search results
 - `response_format`: "markdown" or "json"
 
+### mfp_add_food_to_diary
+Add a food item to your diary for a specific meal and date.
+- `mfp_id` (required): MyFitnessPal food ID from search results (use `mfp_search_food` first)
+- `meal` (optional): Meal name - "Breakfast", "Lunch", "Dinner", or "Snacks" (default: "Breakfast")
+- `date` (optional): YYYY-MM-DD format (default: today)
+- `quantity` (optional): Number of servings (default: 1.0)
+- `unit` (optional): Unit/serving size description (e.g., "1 cup", "100g")
+
+**Example workflow:**
+1. Use `mfp_search_food` to find a food item and get its `mfp_id`
+2. Use `mfp_add_food_to_diary` with the `mfp_id` to add it to your diary
+
 ### mfp_get_measurements
 Get body measurement history.
 - `measurement` (optional): "Weight", "Body Fat", "Waist", etc.
@@ -432,6 +447,11 @@ Update nutrition goals.
 ### mfp_get_water
 Get water intake for a date.
 - `date` (optional): YYYY-MM-DD (default today)
+
+### mfp_set_water
+Log water intake for a date.
+- `cups` (required): Number of cups of water (e.g., 2.5 for 2.5 cups). Note: MyFitnessPal uses cups as the unit (1 cup = ~237ml)
+- `date` (optional): YYYY-MM-DD format (default: today)
 
 ### mfp_get_report
 Get nutrition report over a date range.

@@ -635,6 +635,220 @@ class GetReportInput(BaseModel):
     )
 
 
+class AddFoodToDiaryInput(BaseModel):
+    """Input model for adding food to diary."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    mfp_id: str = Field(
+        ...,
+        description="MyFitnessPal food item ID (obtained from mfp_search_food)",
+        min_length=1,
+    )
+    meal: str = Field(
+        default="Breakfast",
+        description="Meal name (e.g., 'Breakfast', 'Lunch', 'Dinner', 'Snacks')",
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    quantity: float = Field(
+        default=1.0,
+        description="Quantity/servings (e.g., 1.5 for 1.5 servings)",
+        gt=0,
+        le=100,
+    )
+    unit: Optional[str] = Field(
+        default=None,
+        description="Unit/serving size description (e.g., '1 cup', '100g'). If not provided, uses default serving size from food item.",
+    )
+
+
+class SetWaterInput(BaseModel):
+    """Input model for setting water intake."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    cups: float = Field(
+        ...,
+        description="Number of cups of water (e.g., 2.5 for 2.5 cups). Note: MyFitnessPal uses cups as the unit.",
+        ge=0,
+        le=50,
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+
+
+# ============================================================================
+# Diary Entry Creation Helper Functions
+# ============================================================================
+
+
+def add_food_to_diary(
+    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
+) -> None:
+    """
+    Add a food item to the diary for a specific date and meal.
+    
+    Args:
+        client: Authenticated myfitnesspal.Client instance
+        mfp_id: MyFitnessPal food item ID
+        meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
+        target_date: Date to add the food entry
+        quantity: Number of servings (default 1.0)
+        unit: Optional unit/serving size description
+    
+    Raises:
+        RuntimeError: If the operation fails
+    """
+    from urllib import parse
+    
+    try:
+        # Get the diary page for the target date to extract CSRF token
+        # Use the same method the library uses
+        date_str = target_date.strftime("%Y-%m-%d")
+        diary_url = parse.urljoin(
+            client.BASE_URL_SECURE,
+            f"food/diary/{client.effective_username}?date={date_str}"
+        )
+        
+        # Use the library's method to get the document
+        document = client._get_document_for_url(diary_url)
+        
+        # Extract authenticity token (same way the library does)
+        authenticity_token = document.xpath(
+            "(//input[@name='authenticity_token']/@value)[1]"
+        )
+        if not authenticity_token:
+            raise RuntimeError("Could not find authenticity token on diary page")
+        authenticity_token = authenticity_token[0]
+        
+        # Map meal names to meal indices (0=Breakfast, 1=Lunch, 2=Dinner, 3=Snacks)
+        meal_map = {
+            "breakfast": "0",
+            "lunch": "1",
+            "dinner": "2",
+            "snacks": "3",
+            "snack": "3",
+        }
+        meal_index = meal_map.get(meal.lower(), "0")
+        
+        # Build the URL for adding food
+        # MyFitnessPal uses /food/diary/{username}/add endpoint
+        add_food_url = parse.urljoin(
+            client.BASE_URL_SECURE,
+            f"food/diary/{client.effective_username}/add"
+        )
+        
+        # Prepare the data for the POST request
+        # Format matches what MyFitnessPal expects based on their form submissions
+        post_data = {
+            "authenticity_token": authenticity_token,
+            "date": date_str,
+            "meal": meal_index,
+            "food_id": mfp_id,
+            "quantity": str(quantity),
+        }
+        
+        if unit:
+            post_data["unit"] = unit
+        
+        # Add food to diary
+        headers = {
+            "Referer": diary_url,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        
+        response = client.session.post(add_food_url, data=post_data, headers=headers)
+        response.raise_for_status()
+        
+        # Check response content for errors
+        if response.status_code != 200:
+            raise RuntimeError(f"Failed to add food: HTTP {response.status_code}")
+        
+        # MyFitnessPal might return success even with errors in content
+        content = response.text if hasattr(response, 'text') else response.content.decode('utf-8', errors='ignore')
+        if 'error' in content.lower() and 'success' not in content.lower():
+            logger.warning(f"Possible error in response: {content[:200]}")
+        
+        logger.info(f"Successfully added food {mfp_id} to {meal} for {target_date}")
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to add food to diary: {e}")
+
+
+def set_water_intake(client, target_date: date, cups: float) -> None:
+    """
+    Set water intake for a specific date.
+    
+    Args:
+        client: Authenticated myfitnesspal.Client instance
+        target_date: Date to set water intake
+        cups: Number of cups of water
+    
+    Raises:
+        RuntimeError: If the operation fails
+    """
+    from urllib import parse
+    
+    try:
+        # Get the diary page for the target date to extract CSRF token
+        date_str = target_date.strftime("%Y-%m-%d")
+        diary_url = parse.urljoin(
+            client.BASE_URL_SECURE,
+            f"food/diary/{client.effective_username}?date={date_str}"
+        )
+        
+        # Use the library's method to get the document
+        document = client._get_document_for_url(diary_url)
+        
+        # Extract authenticity token
+        authenticity_token = document.xpath(
+            "(//input[@name='authenticity_token']/@value)[1]"
+        )
+        if not authenticity_token:
+            raise RuntimeError("Could not find authenticity token on diary page")
+        authenticity_token = authenticity_token[0]
+        
+        # Build the URL for setting water
+        # MyFitnessPal uses /food/diary/{username}/water endpoint
+        water_url = parse.urljoin(
+            client.BASE_URL_SECURE,
+            f"food/diary/{client.effective_username}/water"
+        )
+        
+        # Prepare the data for the POST request
+        post_data = {
+            "authenticity_token": authenticity_token,
+            "date": date_str,
+            "water": str(cups),
+        }
+        
+        # Set water intake
+        headers = {
+            "Referer": diary_url,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        
+        response = client.session.post(water_url, data=post_data, headers=headers)
+        response.raise_for_status()
+        
+        if response.status_code != 200:
+            raise RuntimeError(f"Failed to set water: HTTP {response.status_code}")
+        
+        logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to set water intake: {e}")
+
+
 # ============================================================================
 # MCP Tools
 # ============================================================================
@@ -1132,6 +1346,125 @@ async def mfp_get_water(params: GetWaterInput) -> str:
 
     except Exception as e:
         return f"Error getting water intake: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_add_food_to_diary",
+    annotations={
+        "title": "Add Food to Diary",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
+    """
+    Add a food item to your MyFitnessPal food diary for a specific date and meal.
+
+    This tool adds a food entry to your diary. You can search for foods using
+    mfp_search_food to find the food ID (mfp_id) needed for this tool.
+
+    Args:
+        params: AddFoodToDiaryInput containing:
+            - mfp_id (str): MyFitnessPal food item ID (from mfp_search_food)
+            - meal (str): Meal name - 'Breakfast', 'Lunch', 'Dinner', or 'Snacks' (default: 'Breakfast')
+            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
+            - quantity (float): Number of servings (default: 1.0)
+            - unit (str, optional): Unit/serving size (e.g., '1 cup', '100g')
+
+    Returns:
+        str: Confirmation message with details of the added food entry
+    """
+    try:
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+        
+        # Normalize meal name (capitalize first letter)
+        meal = params.meal.strip().capitalize()
+        if meal.lower() == "snack":
+            meal = "Snacks"
+        
+        # Add food to diary
+        add_food_to_diary(
+            client=client,
+            mfp_id=params.mfp_id,
+            meal=meal,
+            target_date=target_date,
+            quantity=params.quantity,
+            unit=params.unit,
+        )
+        
+        # Get food details for confirmation
+        try:
+            food_item = client.get_food_item_details(params.mfp_id)
+            food_name = getattr(food_item, "description", "Unknown Food")
+        except:
+            food_name = "Food item"
+        
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Successfully added {food_name} to {meal}",
+                "date": str(target_date),
+                "meal": meal,
+                "food_id": params.mfp_id,
+                "food_name": food_name,
+                "quantity": params.quantity,
+                "unit": params.unit,
+            },
+            indent=2,
+        )
+        
+    except Exception as e:
+        return f"Error adding food to diary: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_set_water",
+    annotations={
+        "title": "Log Water Intake",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_set_water(params: SetWaterInput) -> str:
+    """
+    Log water intake for a specific date.
+
+    Sets the number of cups of water consumed for the day. MyFitnessPal uses
+    cups as the unit (1 cup = ~237ml).
+
+    Args:
+        params: SetWaterInput containing:
+            - cups (float): Number of cups of water (e.g., 2.5 for 2.5 cups)
+            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
+
+    Returns:
+        str: Confirmation message with the logged water amount
+    """
+    try:
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+        
+        # Set water intake
+        set_water_intake(client=client, target_date=target_date, cups=params.cups)
+        
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Successfully logged {params.cups} cups of water",
+                "date": str(target_date),
+                "cups": params.cups,
+                "milliliters": round(params.cups * 236.588, 2),
+            },
+            indent=2,
+        )
+        
+    except Exception as e:
+        return f"Error setting water intake: {str(e)}"
 
 
 @mcp.tool(
