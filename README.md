@@ -44,7 +44,7 @@ This MCP supports multiple authentication methods:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/myfitnesspal-mcp-python.git
+git clone https://github.com/YOUR_USERNAME/myfitnesspal-mcp-python.git
 cd myfitnesspal-mcp-python
 
 # Create virtual environment (use python3.10+ on macOS/Linux)
@@ -256,7 +256,7 @@ myfitnesspal-mcp-python/
 
 ```bash
 # Clone and enter directory
-git clone https://github.com/yourusername/myfitnesspal-mcp-python.git
+git clone https://github.com/YOUR_USERNAME/myfitnesspal-mcp-python.git
 cd myfitnesspal-mcp-python
 
 # Create virtual environment (Python 3.10+ required)
