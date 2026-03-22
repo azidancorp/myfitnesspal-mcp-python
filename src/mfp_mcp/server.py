@@ -1154,11 +1154,28 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
             "water": day.water,
             "notes": day.notes or "",
         }
+        # Fetch entry IDs via raw scraping (library discards these)
+        id_by_position = {}
+        try:
+            session = get_raw_session()
+            date_str = target_date.strftime("%Y-%m-%d")
+            username = client.effective_username
+            raw_entries = raw_get_diary_entries(session, date_str, username)
+            from collections import defaultdict
+            meal_counters = defaultdict(int)
+            for e in raw_entries:
+                meal_key = e["meal"].lower()
+                idx = meal_counters[meal_key]
+                id_by_position.setdefault(meal_key, {})[idx] = e["entry_id"]
+                meal_counters[meal_key] = idx + 1
+        except Exception:
+            logger.debug("Failed to fetch entry IDs via raw scraping, entries will lack entry_id")
+
 
         # Process meals
         for meal in day.meals:
             meal_data = {
-                "entries": [format_meal_entry(entry) for entry in meal.entries],
+                "entries": entries_formatted,
                 "totals": format_nutrition_dict(meal.totals),
             }
             data["meals"][meal.name] = meal_data
@@ -1166,6 +1183,13 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         # Get daily totals and goals
         totals = {}
         for entry in day.entries:
+            entries_formatted = []
+            for i, entry in enumerate(meal.entries):
+                formatted = format_meal_entry(entry)
+                eid = id_by_position.get(meal.name.lower(), {}).get(i)
+                if eid:
+                    formatted["entry_id"] = eid
+                entries_formatted.append(formatted)
             for key, value in entry.totals.items():
                 val = float(value.magnitude) if hasattr(value, "magnitude") else value
                 totals[key] = totals.get(key, 0) + val
@@ -1207,24 +1231,11 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
         str: List of matching food items with basic nutrition info
     """
     try:
-        client = get_mfp_client()
-        results = client.get_food_search_results(params.query)
+        session = get_raw_session()
+        date_str = date.today().strftime("%Y-%m-%d")
+        results = raw_search_foods(session, params.query, date_str, params.limit)
 
-        # Limit results
-        results = results[: params.limit]
-
-        data = {"query": params.query, "count": len(results), "results": []}
-
-        for item in results:
-            data["results"].append(
-                {
-                    "name": item.name,
-                    "brand": item.brand,
-                    "serving": item.serving,
-                    "calories": item.calories,
-                    "mfp_id": item.mfp_id,
-                }
-            )
+        data = {"query": params.query, "count": len(results), "results": results}
 
         return format_response(
             data, params.response_format, f"Food Search Results for '{params.query}'"
