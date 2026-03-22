@@ -887,9 +887,14 @@ class AddFoodToDiaryInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    mfp_id: str = Field(
+    food_id: str = Field(
         ...,
-        description="MyFitnessPal food item ID (obtained from mfp_search_food)",
+        description="MyFitnessPal food_id (obtained from mfp_search_food results)",
+        min_length=1,
+    )
+    serving_id: str = Field(
+        ...,
+        description="Serving size ID (obtained from mfp_search_food results, e.g. the serving_id field)",
         min_length=1,
     )
     meal: str = Field(
@@ -907,9 +912,22 @@ class AddFoodToDiaryInput(BaseModel):
         gt=0,
         le=100,
     )
-    unit: Optional[str] = Field(
+
+
+class DeleteFoodFromDiaryInput(BaseModel):
+    """Input model for deleting a food entry from the diary."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    entry_id: str = Field(
+        ...,
+        description="The diary entry ID to delete (obtain from mfp_get_diary which includes entry_id per food item)",
+        min_length=1,
+    )
+    date: Optional[str] = Field(
         default=None,
-        description="Unit/serving size description (e.g., '1 cup', '100g'). If not provided, uses default serving size from food item.",
+        description="Date in YYYY-MM-DD format. Must match the date the entry belongs to. Defaults to today.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
 
 
@@ -956,25 +974,28 @@ def add_food_to_diary(
     from urllib import parse
     
     try:
-        # Get the diary page for the target date to extract CSRF token
-        # Use the same method the library uses
         date_str = target_date.strftime("%Y-%m-%d")
-        diary_url = parse.urljoin(
+
+        # Get the search/add page to extract CSRF token
+        search_url = parse.urljoin(
             client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}?date={date_str}"
+            f"food/search?search=food&meal=0&date={date_str}"
         )
-        
-        # Use the library's method to get the document
-        document = client._get_document_for_url(diary_url)
-        
-        # Extract authenticity token (same way the library does)
+        document = client._get_document_for_url(search_url)
+
+        # Extract authenticity token from the food-nutritional-details-form
         authenticity_token = document.xpath(
-            "(//input[@name='authenticity_token']/@value)[1]"
+            "(//form[@id='food-nutritional-details-form']//input[@name='authenticity_token']/@value)[1]"
         )
         if not authenticity_token:
-            raise RuntimeError("Could not find authenticity token on diary page")
+            # Fallback to any authenticity token on the page
+            authenticity_token = document.xpath(
+                "(//input[@name='authenticity_token']/@value)[1]"
+            )
+        if not authenticity_token:
+            raise RuntimeError("Could not find authenticity token on search page")
         authenticity_token = authenticity_token[0]
-        
+
         # Map meal names to meal indices (0=Breakfast, 1=Lunch, 2=Dinner, 3=Snacks)
         meal_map = {
             "breakfast": "0",
@@ -984,47 +1005,35 @@ def add_food_to_diary(
             "snack": "3",
         }
         meal_index = meal_map.get(meal.lower(), "0")
-        
-        # Build the URL for adding food
-        # MyFitnessPal uses /food/diary/{username}/add endpoint
+
+        # MFP uses /food/add endpoint with food_entry[] form fields
         add_food_url = parse.urljoin(
             client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}/add"
+            "/food/add"
         )
-        
-        # Prepare the data for the POST request
-        # Format matches what MyFitnessPal expects based on their form submissions
+
         post_data = {
             "authenticity_token": authenticity_token,
-            "date": date_str,
-            "meal": meal_index,
-            "food_id": mfp_id,
-            "quantity": str(quantity),
+            "food_entry[food_id]": str(mfp_id),
+            "food_entry[date]": date_str,
+            "food_entry[meal_id]": meal_index,
+            "food_entry[quantity]": str(quantity),
         }
-        
+
         if unit:
-            post_data["unit"] = unit
-        
-        # Add food to diary
+            post_data["food_entry[weight_id]"] = unit
+
         headers = {
-            "Referer": diary_url,
+            "Referer": search_url,
             "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
         }
-        
+
         response = client.session.post(add_food_url, data=post_data, headers=headers)
         response.raise_for_status()
-        
-        # Check response content for errors
+
         if response.status_code != 200:
             raise RuntimeError(f"Failed to add food: HTTP {response.status_code}")
-        
-        # MyFitnessPal might return success even with errors in content
-        # Log error indication without exposing full response content (may contain sensitive data)
-        content = response.text if hasattr(response, 'text') else response.content.decode('utf-8', errors='ignore')
-        if 'error' in content.lower() and 'success' not in content.lower():
-            logger.warning("Possible error in response from MyFitnessPal API")
-        
+
         logger.info(f"Successfully added food {mfp_id} to {meal} for {target_date}")
         
     except Exception as e:
@@ -1034,7 +1043,7 @@ def add_food_to_diary(
         if "HTTP" in error_msg or "status" in error_msg.lower():
             raise RuntimeError(f"Failed to add food to diary: {error_msg}")
         else:
-            raise RuntimeError("Failed to add food to diary. Please check your authentication and try again.")
+            raise RuntimeError(f"Failed to add food to diary: {error_msg}")
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
@@ -1145,15 +1154,6 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
 
-        # Build response data
-        data = {
-            "date": str(target_date),
-            "meals": {},
-            "daily_totals": {},
-            "daily_goals": {},
-            "water": day.water,
-            "notes": day.notes or "",
-        }
         # Fetch entry IDs via raw scraping (library discards these)
         id_by_position = {}
         try:
@@ -1171,9 +1171,25 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         except Exception:
             logger.debug("Failed to fetch entry IDs via raw scraping, entries will lack entry_id")
 
+        # Build response data
+        data = {
+            "date": str(target_date),
+            "meals": {},
+            "daily_totals": {},
+            "daily_goals": {},
+            "water": day.water,
+            "notes": day.notes or "",
+        }
 
         # Process meals
         for meal in day.meals:
+            entries_formatted = []
+            for i, entry in enumerate(meal.entries):
+                formatted = format_meal_entry(entry)
+                eid = id_by_position.get(meal.name.lower(), {}).get(i)
+                if eid:
+                    formatted["entry_id"] = eid
+                entries_formatted.append(formatted)
             meal_data = {
                 "entries": entries_formatted,
                 "totals": format_nutrition_dict(meal.totals),
@@ -1183,13 +1199,6 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         # Get daily totals and goals
         totals = {}
         for entry in day.entries:
-            entries_formatted = []
-            for i, entry in enumerate(meal.entries):
-                formatted = format_meal_entry(entry)
-                eid = id_by_position.get(meal.name.lower(), {}).get(i)
-                if eid:
-                    formatted["entry_id"] = eid
-                entries_formatted.append(formatted)
             for key, value in entry.totals.items():
                 val = float(value.magnitude) if hasattr(value, "magnitude") else value
                 totals[key] = totals.get(key, 0) + val
@@ -1634,61 +1643,139 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     Add a food item to your MyFitnessPal food diary for a specific date and meal.
 
     This tool adds a food entry to your diary. You can search for foods using
-    mfp_search_food to find the food ID (mfp_id) needed for this tool.
+    mfp_search_food to find the food_id and serving_id needed for this tool.
 
     Args:
         params: AddFoodToDiaryInput containing:
-            - mfp_id (str): MyFitnessPal food item ID (from mfp_search_food)
+            - food_id (str): MyFitnessPal food_id (from mfp_search_food)
+            - serving_id (str): Serving size ID (from mfp_search_food)
             - meal (str): Meal name - 'Breakfast', 'Lunch', 'Dinner', or 'Snacks' (default: 'Breakfast')
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
             - quantity (float): Number of servings (default: 1.0)
-            - unit (str, optional): Unit/serving size (e.g., '1 cup', '100g')
 
     Returns:
         str: Confirmation message with details of the added food entry
     """
     try:
-        client = get_mfp_client()
+        session = get_raw_session()
         target_date = parse_date(params.date)
-        
-        # Normalize meal name (capitalize first letter)
+        date_str = target_date.strftime("%Y-%m-%d")
+
+        # Normalize meal name
         meal = params.meal.strip().capitalize()
         if meal.lower() == "snack":
             meal = "Snacks"
-        
-        # Add food to diary
-        add_food_to_diary(
-            client=client,
-            mfp_id=params.mfp_id,
-            meal=meal,
-            target_date=target_date,
+
+        meal_map = {
+            "breakfast": "0", "lunch": "1",
+            "dinner": "2", "snacks": "3",
+        }
+        meal_index = meal_map.get(meal.lower(), "0")
+
+        raw_add_food(
+            session=session,
+            food_id=params.food_id,
+            serving_id=params.serving_id,
+            date_str=date_str,
+            meal_index=meal_index,
             quantity=params.quantity,
-            unit=params.unit,
         )
-        
-        # Get food details for confirmation
-        try:
-            food_item = client.get_food_item_details(params.mfp_id)
-            food_name = getattr(food_item, "description", "Unknown Food")
-        except:
-            food_name = "Food item"
-        
+
         return json.dumps(
             {
                 "success": True,
-                "message": f"Successfully added {food_name} to {meal}",
-                "date": str(target_date),
+                "message": f"Successfully added food to {meal}",
+                "date": date_str,
                 "meal": meal,
-                "food_id": params.mfp_id,
-                "food_name": food_name,
+                "food_id": params.food_id,
+                "serving_id": params.serving_id,
                 "quantity": params.quantity,
-                "unit": params.unit,
             },
             indent=2,
         )
-        
+
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_food_from_diary",
+    annotations={
+        "title": "Delete Food from Diary",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_food_from_diary(params: DeleteFoodFromDiaryInput) -> str:
+    """
+    Delete a food entry from your MyFitnessPal food diary.
+
+    Use mfp_get_diary to see entries with their entry_id, then pass the
+    entry_id here to delete that specific entry.
+
+    Args:
+        params: DeleteFoodFromDiaryInput containing:
+            - entry_id (str): The diary entry ID (from mfp_get_diary output)
+            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
+
+    Returns:
+        str: Confirmation message with details of the deleted food entry
+    """
+    try:
+        session = get_raw_session()
+        target_date = parse_date(params.date)
+        date_str = target_date.strftime("%Y-%m-%d")
+
+        # Use empty username so raw functions hit /food/diary (cookie-authed)
+        username = ""
+
+        # Verify entry exists and get its name for confirmation
+        deleted_name = None
+        deleted_meal = None
+        try:
+            diary_entries = raw_get_diary_entries(session, date_str, username)
+            for entry in diary_entries:
+                if entry["entry_id"] == params.entry_id:
+                    deleted_name = entry["name"]
+                    deleted_meal = entry["meal"]
+                    break
+            if deleted_name is None:
+                return json.dumps({
+                    "success": False,
+                    "message": f"Entry ID '{params.entry_id}' not found in diary for {date_str}",
+                }, indent=2)
+        except Exception:
+            pass  # proceed with delete anyway
+
+        raw_delete_food_entry(
+            session=session,
+            entry_id=params.entry_id,
+            date_str=date_str,
+            username=username,
+        )
+
+        msg = "Successfully deleted"
+        if deleted_name:
+            msg += f" '{deleted_name}'"
+        if deleted_meal:
+            msg += f" from {deleted_meal}"
+
+        return json.dumps(
+            {
+                "success": True,
+                "message": msg,
+                "date": date_str,
+                "entry_id": params.entry_id,
+                "deleted_food": deleted_name,
+                "meal": deleted_meal,
+            },
+            indent=2,
+        )
+
+    except Exception as e:
+        return f"Error deleting food from diary: {str(e)}"
 
 
 @mcp.tool(
