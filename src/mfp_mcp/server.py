@@ -23,6 +23,8 @@ from enum import Enum
 from collections import OrderedDict
 import time
 
+import requests as req_lib
+import lxml.html
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict, field_validator
@@ -296,6 +298,250 @@ def get_mfp_client():
             "2. Log into myfitnesspal.com in Chrome or Firefox\n"
             "3. Check ~/.mfp_mcp/cookies.json for stored session"
         )
+
+
+NETSCAPE_COOKIES_FILE = Path.home() / "Downloads" / "www.myfitnesspal.com_cookies.txt"
+
+def get_raw_session() -> req_lib.Session:
+    """
+    Get a requests.Session authenticated with MFP cookies.
+    Loads cookies from the Netscape cookie file exported from the browser,
+    falling back to stored JSON cookies.
+    """
+    session = req_lib.Session()
+    session.headers["User-Agent"] = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    )
+
+    # Try Netscape cookie file first
+    if NETSCAPE_COOKIES_FILE.exists():
+        with open(NETSCAPE_COOKIES_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    session.cookies.set(
+                        parts[5], parts[6],
+                        domain=parts[0],
+                        secure=(parts[3] == "TRUE"),
+                    )
+        if session.cookies:
+            return session
+
+    # Fallback to stored JSON cookies
+    stored = load_cookies()
+    if stored:
+        for name, value in stored.items():
+            session.cookies.set(name, value, domain=".myfitnesspal.com")
+        return session
+
+    raise RuntimeError(
+        "No cookies available. Export cookies from your browser to "
+        f"{NETSCAPE_COOKIES_FILE} or run refresh_browser_cookies."
+    )
+
+
+def raw_search_foods(session: req_lib.Session, query: str, date_str: str, limit: int = 10):
+    """
+    Search MFP foods by scraping the HTML search page.
+    Returns list of dicts with food_id (original_id), name, brand, calories,
+    verified, serving_id (first weight_id), and all serving_ids.
+    """
+    r = session.get(
+        "https://www.myfitnesspal.com/food/search",
+        params={"search": query, "meal": "0", "date": date_str},
+    )
+    r.raise_for_status()
+    doc = lxml.html.document_fromstring(r.text)
+
+    results = []
+    for a in doc.xpath("//a[@data-external-id]")[:limit]:
+        weight_ids = [w for w in a.get("data-weight-ids", "").split(",") if w]
+        # Extract brand/calories from sibling nutritional-info paragraph
+        li = a.getparent()
+        while li is not None and li.tag != "li":
+            li = li.getparent()
+        brand = ""
+        calories = None
+        serving = ""
+        if li is not None:
+            info_el = li.xpath(".//p[@class='search-nutritional-info']")
+            if info_el:
+                info_text = info_el[0].text_content().strip().split(",")
+                if len(info_text) >= 3:
+                    brand = ", ".join(info_text[0:-2]).strip()
+                    serving = info_text[-2].strip()
+                    try:
+                        calories = float(info_text[-1].replace("calories", "").strip())
+                    except ValueError:
+                        pass
+                elif len(info_text) == 2:
+                    serving = info_text[0].strip()
+                    try:
+                        calories = float(info_text[-1].replace("calories", "").strip())
+                    except ValueError:
+                        pass
+
+        results.append({
+            "name": a.text_content().strip(),
+            "brand": brand,
+            "serving": serving,
+            "calories": calories,
+            "food_id": a.get("data-original-id"),
+            "mfp_id": a.get("data-external-id"),
+            "verified": a.get("data-verified") == "true",
+            "serving_id": weight_ids[0] if weight_ids else None,
+            "serving_ids": weight_ids,
+        })
+
+    return results
+
+
+def raw_add_food(
+    session: req_lib.Session,
+    food_id: str,
+    serving_id: str,
+    date_str: str,
+    meal_index: str,
+    quantity: float,
+):
+    """
+    Add a food to the MFP diary using the web form endpoint.
+    Uses food_id (original_id) and serving_id (weight_id).
+    """
+    # Get CSRF token from search page
+    r = session.get(
+        "https://www.myfitnesspal.com/food/search",
+        params={"search": "food", "meal": "0", "date": date_str},
+    )
+    r.raise_for_status()
+    doc = lxml.html.document_fromstring(r.text)
+
+    tokens = doc.xpath(
+        "//form[@id='food-nutritional-details-form']"
+        "//input[@name='authenticity_token']/@value"
+    )
+    if not tokens:
+        tokens = doc.xpath("//input[@name='authenticity_token']/@value")
+    if not tokens:
+        raise RuntimeError("Could not find CSRF token")
+    csrf = tokens[0]
+
+    r = session.post(
+        "https://www.myfitnesspal.com/food/add",
+        data={
+            "authenticity_token": csrf,
+            "food_entry[food_id]": food_id,
+            "food_entry[date]": date_str,
+            "food_entry[meal_id]": meal_index,
+            "food_entry[quantity]": str(quantity),
+            "food_entry[weight_id]": serving_id,
+        },
+        headers={
+            "Referer": "https://www.myfitnesspal.com/food/search",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        allow_redirects=True,
+    )
+    # MFP returns 302 -> 200 on success
+    if r.history and r.history[0].status_code == 302:
+        return  # success
+    r.raise_for_status()
+
+
+def raw_get_diary_entries(
+    session: req_lib.Session, date_str: str, username: str
+) -> List[Dict[str, Any]]:
+    """
+    Scrape the MFP diary HTML to extract entry IDs, food names, and meal associations.
+    The myfitnesspal library discards entry IDs; this function recovers them.
+
+    Returns list of dicts: [{"entry_id": "123", "name": "Chicken Breast", "meal": "Lunch"}, ...]
+    """
+    url = f"https://www.myfitnesspal.com/food/diary/{username}" if username else "https://www.myfitnesspal.com/food/diary"
+    r = session.get(url, params={"date": date_str})
+    r.raise_for_status()
+    doc = lxml.html.document_fromstring(r.text)
+
+    entries = []
+    current_meal = None
+    meal_headers = doc.xpath("//tr[@class='meal_header']")
+
+    for meal_header in meal_headers:
+        tds = meal_header.findall("td")
+        current_meal = tds[0].text.strip().capitalize() if tds else None
+        this = meal_header
+
+        while True:
+            this = this.getnext()
+            if this is None:
+                break
+            if this.attrib.get("class") is not None:
+                break
+
+            columns = this.findall("td")
+            if not columns:
+                continue
+
+            # Entry ID is on the <a> tag's data-food-entry-id attribute in the first column
+            a_tag = columns[0].find(".//a[@data-food-entry-id]")
+            if a_tag is None:
+                continue
+
+            entry_id = a_tag.get("data-food-entry-id")
+            name = a_tag.text.strip() if a_tag.text else columns[0].text_content().strip()
+
+            entries.append({
+                "entry_id": entry_id,
+                "name": name,
+                "meal": current_meal or "Unknown",
+            })
+
+    return entries
+
+
+def raw_delete_food_entry(
+    session: req_lib.Session,
+    entry_id: str,
+    date_str: str,
+    username: str,
+) -> None:
+    """
+    Delete a food diary entry using the MFP web form endpoint.
+    Uses Rails-style DELETE-via-POST: POST /food/remove/{entry_id}
+    with _method=delete and authenticity_token.
+    """
+    # Fetch diary page for CSRF token
+    diary_url = f"https://www.myfitnesspal.com/food/diary/{username}" if username else "https://www.myfitnesspal.com/food/diary"
+    r = session.get(diary_url, params={"date": date_str})
+    r.raise_for_status()
+    doc = lxml.html.document_fromstring(r.text)
+
+    tokens = doc.xpath("//input[@name='authenticity_token']/@value")
+    if not tokens:
+        raise RuntimeError("Could not find CSRF token on diary page")
+    csrf = tokens[0]
+
+    r = session.post(
+        f"https://www.myfitnesspal.com/food/remove/{entry_id}",
+        data={
+            "_method": "delete",
+            "authenticity_token": csrf,
+        },
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.myfitnesspal.com",
+            "Referer": "https://www.myfitnesspal.com/food/diary",
+        },
+        allow_redirects=True,
+    )
+    # MFP returns 302 redirect on success
+    if r.history and r.history[0].status_code == 302:
+        return  # success
+    r.raise_for_status()
 
 
 # ============================================================================
