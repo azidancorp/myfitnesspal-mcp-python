@@ -37,10 +37,9 @@ dependencies = [
     "mcp>=1.0.0",
     "myfitnesspal>=2.0.0",
     "pydantic>=2.0.0",
-    "httpx>=0.24.0",
-    "browser-cookie3>=0.19.0",
-    "pint>=0.22",
-    "keyring>=24.0.0",
+    "browser-cookie3>=0.19.1",
+    "requests>=2.28.0",
+    "lxml>=4.9.0",
 ]
 
 [project.optional-dependencies]

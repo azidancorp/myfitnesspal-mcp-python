@@ -3,17 +3,17 @@ MyFitnessPal MCP Server
 
 A Model Context Protocol (MCP) server that provides tools for interacting
 with MyFitnessPal data including food diary, exercises, measurements, goals,
-water intake, and food search.
+and food search.
 
-Authentication Methods (in order of priority):
-1. Environment variables: MFP_USERNAME and MFP_PASSWORD
-2. Stored session cookies: ~/.mfp_mcp/cookies.json
-3. Browser cookies: Chrome/Firefox (fallback)
+Authentication:
+  Cookies are the single auth method. The server loads from ~/.mfp_mcp/cookies.json.
+  If a Netscape-format cookie export exists at ~/Downloads/www.myfitnesspal.com_cookies.txt
+  and is newer than cookies.json, it is auto-imported on the next tool call.
 """
 
 import json
+import importlib
 import logging
-import os
 import sys
 from datetime import date, datetime, timedelta
 from http.cookiejar import CookieJar, Cookie
@@ -25,7 +25,6 @@ import time
 
 import requests as req_lib
 import lxml.html
-import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
@@ -43,11 +42,35 @@ mcp = FastMCP("myfitnesspal_mcp")
 # Configuration paths
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
+NETSCAPE_COOKIES_FILE = Path.home() / "Downloads" / "www.myfitnesspal.com_cookies.txt"
+BROWSER_IMPORT_ORDER = ("brave", "chrome", "chromium", "firefox")
+COOKIE_REFRESH_WINDOW = timedelta(hours=6)
+CRITICAL_COOKIE_NAMES = (
+    "__Secure-next-auth.session-token",
+    "_mfp_session",
+    "cf_clearance",
+    "__cf_bm",
+    "__Host-next-auth.csrf-token",
+)
+AUTO_REFRESH_COOKIE_NAMES = (
+    "__Secure-next-auth.session-token",
+    "_mfp_session",
+    "cf_clearance",
+    "__Host-next-auth.csrf-token",
+)
 
 
 # ============================================================================
 # Authentication Helper Functions
 # ============================================================================
+
+_NO_COOKIES_MSG = (
+    "No valid cookies found.\n"
+    "Export cookies from your browser (Netscape format) to:\n"
+    f"  {NETSCAPE_COOKIES_FILE}\n"
+    "or manually place a cookies.json in:\n"
+    f"  {COOKIES_FILE}"
+)
 
 
 def ensure_config_dir():
@@ -55,293 +78,399 @@ def ensure_config_dir():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def save_cookies(cookies: Dict[str, str]):
+def normalize_cookie_records(raw_cookies: Any) -> List[Dict[str, Any]]:
     """
-    Save session cookies to file for persistence.
-    
-    Args:
-        cookies: Dictionary of cookie name -> value
+    Normalize cookies from either the legacy dict format or the richer list format.
     """
+    normalized = []
+
+    if isinstance(raw_cookies, dict):
+        for name, value in raw_cookies.items():
+            normalized.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": ".myfitnesspal.com",
+                    "path": "/",
+                    "secure": True,
+                    "expires": None,
+                    "discard": False,
+                    "source": "legacy-json",
+                }
+            )
+        return normalized
+
+    if not isinstance(raw_cookies, list):
+        return normalized
+
+    for item in raw_cookies:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        value = item.get("value")
+        if not name or value is None:
+            continue
+        expires = item.get("expires")
+        normalized.append(
+            {
+                "name": str(name),
+                "value": str(value),
+                "domain": item.get("domain") or ".myfitnesspal.com",
+                "path": item.get("path") or "/",
+                "secure": bool(item.get("secure", True)),
+                "expires": (
+                    int(expires)
+                    if isinstance(expires, (int, float))
+                    or (isinstance(expires, str) and expires.isdigit())
+                    else None
+                ),
+                "discard": bool(item.get("discard", False)),
+                "source": item.get("source", "saved-cookie-record"),
+            }
+        )
+
+    return normalized
+
+
+def cookiejar_to_records(cookiejar: CookieJar, source: str) -> List[Dict[str, Any]]:
+    """Convert a CookieJar into serializable cookie records."""
+    records = []
+    for cookie in cookiejar:
+        records.append(
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path or "/",
+                "secure": bool(cookie.secure),
+                "expires": cookie.expires,
+                "discard": bool(cookie.discard),
+                "source": source,
+            }
+        )
+    return records
+
+
+def cookie_records_to_dict(cookie_records: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Collapse cookie records into the name -> value format used by callers."""
+    return {record["name"]: record["value"] for record in cookie_records}
+
+
+def summarize_cookie_records(
+    cookie_records: List[Dict[str, Any]], saved_at: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """Summarize cookie freshness, focusing on the cookies required for writes."""
+    now = time.time()
+    by_name = {record["name"]: record for record in cookie_records}
+    missing = [name for name in CRITICAL_COOKIE_NAMES if name not in by_name]
+    auto_refresh_missing = [
+        name for name in AUTO_REFRESH_COOKIE_NAMES if name not in by_name
+    ]
+    expiring_soon = []
+    expired = []
+    auto_refresh_expiring_soon = []
+    auto_refresh_expired = []
+
+    for name in CRITICAL_COOKIE_NAMES:
+        record = by_name.get(name)
+        if not record:
+            continue
+        expires = record.get("expires")
+        if expires in (None, 0):
+            continue
+        expires_dt = datetime.fromtimestamp(int(expires))
+        if expires_dt <= datetime.now():
+            expired.append(name)
+            if name in AUTO_REFRESH_COOKIE_NAMES:
+                auto_refresh_expired.append(name)
+        elif expires_dt - datetime.now() <= COOKIE_REFRESH_WINDOW:
+            expiring_soon.append(name)
+            if name in AUTO_REFRESH_COOKIE_NAMES:
+                auto_refresh_expiring_soon.append(name)
+
+    return {
+        "count": len(cookie_records),
+        "missing_critical": missing,
+        "expired_critical": expired,
+        "expiring_soon_critical": expiring_soon,
+        "saved_at": saved_at.isoformat() if saved_at else None,
+        "needs_refresh": bool(auto_refresh_missing or auto_refresh_expired),
+        "refresh_recommended": bool(
+            auto_refresh_missing or auto_refresh_expired or auto_refresh_expiring_soon
+        ),
+        "important_cookies": {
+            name: {
+                "present": name in by_name,
+                "expires_at": (
+                    datetime.fromtimestamp(int(by_name[name]["expires"])).isoformat()
+                    if name in by_name and by_name[name].get("expires") not in (None, 0)
+                    else None
+                ),
+                "session_cookie": bool(
+                    name in by_name and by_name[name].get("expires") in (None, 0)
+                ),
+            }
+            for name in CRITICAL_COOKIE_NAMES
+        },
+        "checked_at": datetime.fromtimestamp(now).isoformat(),
+    }
+
+
+def save_cookies(cookie_records: List[Dict[str, Any]], source: str = "unknown"):
+    """Save cookie records to ~/.mfp_mcp/cookies.json."""
     ensure_config_dir()
     cookie_data = {
-        "cookies": cookies,
+        "cookies": cookie_records,
+        "source": source,
         "saved_at": datetime.now().isoformat(),
     }
     with open(COOKIES_FILE, "w") as f:
         json.dump(cookie_data, f, indent=2)
-    logger.info(f"Saved session cookies to {COOKIES_FILE}")
+    logger.info(f"Saved {len(cookie_records)} cookies to {COOKIES_FILE} from {source}")
 
 
-def load_cookies() -> Optional[Dict[str, str]]:
+def import_netscape_cookies() -> Optional[List[Dict[str, Any]]]:
     """
-    Load session cookies from file.
-    
-    Returns:
-        Dictionary of cookies if file exists and is valid, None otherwise
+    Parse a Netscape-format cookie file into structured cookie records.
+    Returns None if the file doesn't exist or is empty.
     """
-    if not COOKIES_FILE.exists():
+    if not NETSCAPE_COOKIES_FILE.exists():
         return None
-    
+
+    cookies = []
+    with open(NETSCAPE_COOKIES_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                expires_raw = parts[4]
+                expires = int(expires_raw) if expires_raw.isdigit() and expires_raw != "0" else None
+                cookies.append(
+                    {
+                        "domain": parts[0],
+                        "path": parts[2] or "/",
+                        "secure": parts[3] == "TRUE",
+                        "expires": expires,
+                        "discard": expires is None,
+                        "name": parts[5],
+                        "value": parts[6],
+                        "source": "netscape-export",
+                    }
+                )
+
+    if cookies:
+        logger.info(
+            f"Parsed {len(cookies)} cookies from Netscape file "
+            f"{NETSCAPE_COOKIES_FILE}"
+        )
+        return normalize_cookie_records(cookies)
+    return None
+
+
+def import_browser_cookies(
+    preferred_browser: Optional[str] = None,
+) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """
+    Attempt to import cookies directly from a browser profile.
+    """
+    if importlib.util.find_spec("browser_cookie3") is None:
+        return None, None
+
+    import browser_cookie3
+
+    browsers = [preferred_browser] if preferred_browser else list(BROWSER_IMPORT_ORDER)
+    for browser_name in browsers:
+        if not browser_name:
+            continue
+        loader = getattr(browser_cookie3, browser_name, None)
+        if loader is None:
+            continue
+        try:
+            jar = loader(domain_name="myfitnesspal.com")
+            records = normalize_cookie_records(
+                cookiejar_to_records(jar, source=f"browser:{browser_name}")
+            )
+            if records:
+                logger.info(
+                    f"Imported {len(records)} cookies directly from {browser_name}"
+                )
+                return records, browser_name
+        except Exception as exc:
+            logger.info(f"Could not import cookies from {browser_name}: {exc}")
+
+    return None, None
+
+
+def maybe_refresh_cookie_records(
+    cookie_records: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Refresh stale or near-expiry cookies from a live browser session when possible."""
+    summary = summarize_cookie_records(cookie_records)
+    if not summary["needs_refresh"]:
+        return cookie_records
+
+    imported, browser_name = import_browser_cookies(preferred_browser="brave")
+    if imported and browser_name:
+        save_cookies(imported, source=f"browser:{browser_name}")
+        return imported
+
+    logger.warning(
+        "Cookie refresh recommended. Missing=%s expired=%s expiring_soon=%s",
+        summary["missing_critical"],
+        summary["expired_critical"],
+        summary["expiring_soon_critical"],
+    )
+    return cookie_records
+
+
+def load_cookie_records() -> Optional[List[Dict[str, Any]]]:
+    """
+    Load session cookies from the single source of truth (cookies.json).
+    Auto-imports from Netscape cookie file if it's newer than cookies.json.
+
+    Returns:
+        Structured cookie records if available and fresh, None otherwise.
+    """
+    # Check if Netscape export is newer → auto-import
+    if NETSCAPE_COOKIES_FILE.exists():
+        netscape_mtime = NETSCAPE_COOKIES_FILE.stat().st_mtime
+        cookies_mtime = COOKIES_FILE.stat().st_mtime if COOKIES_FILE.exists() else 0
+
+        if netscape_mtime > cookies_mtime:
+            logger.info("Netscape cookie file is newer than cookies.json — importing...")
+            imported = import_netscape_cookies()
+            if imported:
+                save_cookies(imported, source="netscape-export")
+                return maybe_refresh_cookie_records(imported)
+
+    # Load from cookies.json
+    if not COOKIES_FILE.exists():
+        imported, browser_name = import_browser_cookies(preferred_browser="brave")
+        if imported and browser_name:
+            save_cookies(imported, source=f"browser:{browser_name}")
+            return imported
+        return None
+
     try:
         with open(COOKIES_FILE, "r") as f:
             cookie_data = json.load(f)
-        
-        # Check if cookies are less than 30 days old
+
         saved_at = datetime.fromisoformat(cookie_data.get("saved_at", "2000-01-01"))
-        if datetime.now() - saved_at > timedelta(days=30):
-            logger.info("Stored cookies are expired (>30 days old)")
+        age = datetime.now() - saved_at
+        if age > timedelta(days=30):
+            logger.warning(f"Stored cookies expired ({age.days} days old)")
+            imported, browser_name = import_browser_cookies(preferred_browser="brave")
+            if imported and browser_name:
+                save_cookies(imported, source=f"browser:{browser_name}")
+                return imported
             return None
-        
-        return cookie_data.get("cookies")
-    except Exception as e:
+
+        cookies = normalize_cookie_records(cookie_data.get("cookies"))
+        if cookies:
+            summary = summarize_cookie_records(cookies, saved_at=saved_at)
+            logger.info(
+                f"Loaded {len(cookies)} cookies from {COOKIES_FILE} "
+                f"(saved: {saved_at.strftime('%Y-%m-%d %H:%M')})"
+            )
+            if summary["needs_refresh"]:
+                logger.info(
+                    "Cookie refresh recommended. Missing=%s expired=%s expiring_soon=%s",
+                    summary["missing_critical"],
+                    summary["expired_critical"],
+                    summary["expiring_soon_critical"],
+                )
+        return maybe_refresh_cookie_records(cookies)
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
         logger.warning(f"Failed to load cookies: {e}")
         return None
 
 
-def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal.com") -> CookieJar:
-    """
-    Convert a dictionary of cookies to a CookieJar that can be used by myfitnesspal.Client.
-    
-    Args:
-        cookies_dict: Dictionary of cookie name -> value
-        domain: Domain for the cookies (default: .myfitnesspal.com)
-    
-    Returns:
-        CookieJar: A CookieJar object populated with the cookies
-    """
+def cookie_records_to_cookiejar(cookie_records: List[Dict[str, Any]]) -> CookieJar:
+    """Convert cookie records to a CookieJar for myfitnesspal.Client."""
     jar = CookieJar()
-    
-    for name, value in cookies_dict.items():
+
+    for record in cookie_records:
+        domain = record.get("domain") or ".myfitnesspal.com"
+        path = record.get("path") or "/"
         cookie = Cookie(
             version=0,
-            name=name,
-            value=value,
+            name=record["name"],
+            value=record["value"],
             port=None,
             port_specified=False,
             domain=domain,
             domain_specified=True,
             domain_initial_dot=domain.startswith('.'),
-            path="/",
+            path=path,
             path_specified=True,
-            secure=True,
-            expires=int(time.time()) + 86400 * 30,  # 30 days from now
-            discard=False,
+            secure=bool(record.get("secure", True)),
+            expires=record.get("expires"),
+            discard=bool(record.get("discard", record.get("expires") in (None, 0))),
             comment=None,
             comment_url=None,
             rest={"HttpOnly": None},
             rfc2109=False,
         )
         jar.set_cookie(cookie)
-    
+
     return jar
-
-
-def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
-    """
-    Authenticate with MyFitnessPal using username/password.
-    
-    Args:
-        username: MyFitnessPal username or email
-        password: MyFitnessPal password
-    
-    Returns:
-        Dictionary of session cookies
-        
-    Raises:
-        RuntimeError: If authentication fails
-    """
-    # Log authentication attempt without exposing the username
-    logger.info("Authenticating with credentials")
-    
-    # MyFitnessPal login URL and endpoints
-    LOGIN_URL = "https://www.myfitnesspal.com/account/login"
-    
-    try:
-        with httpx.Client(follow_redirects=True, timeout=30.0) as client:
-            # First, get the login page to obtain CSRF token
-            response = client.get(LOGIN_URL)
-            response.raise_for_status()
-            
-            # Extract CSRF token from cookies or page
-            cookies = dict(response.cookies)
-            
-            # Attempt login
-            login_data = {
-                "username": username,
-                "password": password,
-            }
-            
-            # Try the standard form login
-            login_response = client.post(
-                LOGIN_URL,
-                data=login_data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": LOGIN_URL,
-                },
-            )
-            
-            # Check if login was successful by looking for session cookies
-            all_cookies = dict(client.cookies)
-            
-            # MFP uses various session cookie names
-            session_indicators = ["user", "session", "auth", "logged_in"]
-            has_session = any(
-                any(indicator in name.lower() for indicator in session_indicators)
-                for name in all_cookies.keys()
-            )
-            
-            if has_session or len(all_cookies) > len(cookies):
-                logger.info("Successfully authenticated with credentials")
-                return all_cookies
-            else:
-                # Try to check if we can access authenticated content
-                test_response = client.get("https://www.myfitnesspal.com/food/diary")
-                if test_response.status_code == 200 and "login" not in str(test_response.url).lower():
-                    return dict(client.cookies)
-                    
-                raise RuntimeError("Login appeared to fail - no session cookies received")
-                
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"HTTP error during authentication: {e}")
-    except Exception as e:
-        raise RuntimeError(f"Authentication failed: {e}")
 
 
 def get_mfp_client():
     """
-    Get an authenticated MyFitnessPal client.
-    
-    Authentication is attempted in this order:
-    1. Environment variables (MFP_USERNAME, MFP_PASSWORD)
-    2. Stored session cookies (~/.mfp_mcp/cookies.json)
-    3. Browser cookies (Chrome/Firefox)
+    Get an authenticated MyFitnessPal client using stored cookies.
 
     Returns:
         myfitnesspal.Client: Authenticated client instance
 
     Raises:
-        RuntimeError: If all authentication methods fail
+        RuntimeError: If no valid cookies are available
     """
     import myfitnesspal
-    
-    last_error = None
-    
-    # Method 1: Try environment variable credentials
-    username = os.environ.get("MFP_USERNAME")
-    password = os.environ.get("MFP_PASSWORD")
-    
-    if username and password:
-        logger.info("Attempting authentication with environment credentials")
-        
-        # First check if we have valid stored cookies from a previous credential auth
-        stored_cookies = load_cookies()
-        if stored_cookies:
-            logger.info("Found stored session cookies, testing validity...")
-            try:
-                cookiejar = dict_to_cookiejar(stored_cookies)
-                client = myfitnesspal.Client(cookiejar=cookiejar)
-                # Test the connection
-                _ = client.get_date(date.today())
-                logger.info("Stored cookies are valid")
-                return client
-            except Exception as e:
-                logger.info(f"Stored cookies invalid: {e}, re-authenticating...")
-        
-        # Authenticate with credentials and save cookies
-        try:
-            cookies = authenticate_with_credentials(username, password)
-            save_cookies(cookies)
-            
-            # Create client with the new cookies
-            cookiejar = dict_to_cookiejar(cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
-            logger.info("Successfully authenticated with credentials")
-            return client
-            
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Credential authentication failed: {e}")
-            # Fall through to other methods
-    
-    # Method 2: Try stored session cookies (without credential auth)
-    stored_cookies = load_cookies()
-    if stored_cookies:
-        logger.info("Attempting authentication with stored cookies")
-        try:
-            cookiejar = dict_to_cookiejar(stored_cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
-            logger.info("Successfully authenticated with stored cookies")
-            return client
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Stored cookie authentication failed: {e}")
-    
-    # Method 3: Try browser cookies (default behavior)
-    logger.info("Attempting authentication with browser cookies")
+
+    cookie_records = load_cookie_records()
+    if not cookie_records:
+        raise RuntimeError(_NO_COOKIES_MSG)
+
     try:
-        client = myfitnesspal.Client()
-        # Test the connection
+        cookiejar = cookie_records_to_cookiejar(cookie_records)
+        client = myfitnesspal.Client(cookiejar=cookiejar)
         _ = client.get_date(date.today())
-        logger.info("Successfully authenticated with browser cookies")
         return client
     except Exception as e:
-        last_error = e
         raise RuntimeError(
-            f"All authentication methods failed. Last error: {str(last_error)}\n\n"
-            "Please try one of these solutions:\n"
-            "1. Set MFP_USERNAME and MFP_PASSWORD environment variables in Claude Desktop config\n"
-            "2. Log into myfitnesspal.com in Chrome or Firefox\n"
-            "3. Check ~/.mfp_mcp/cookies.json for stored session"
+            f"Cookies loaded but authentication failed: {e}\n\n"
+            "Your session may have expired. Re-export cookies from your browser."
         )
 
-
-NETSCAPE_COOKIES_FILE = Path.home() / "Downloads" / "www.myfitnesspal.com_cookies.txt"
 
 def get_raw_session() -> req_lib.Session:
     """
     Get a requests.Session authenticated with MFP cookies.
-    Loads cookies from the Netscape cookie file exported from the browser,
-    falling back to stored JSON cookies.
+    Uses the same cookie source as get_mfp_client() (cookies.json).
     """
+    cookie_records = load_cookie_records()
+    if not cookie_records:
+        raise RuntimeError(_NO_COOKIES_MSG)
+
     session = req_lib.Session()
     session.headers["User-Agent"] = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
     )
 
-    # Try Netscape cookie file first
-    if NETSCAPE_COOKIES_FILE.exists():
-        with open(NETSCAPE_COOKIES_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 7:
-                    session.cookies.set(
-                        parts[5], parts[6],
-                        domain=parts[0],
-                        secure=(parts[3] == "TRUE"),
-                    )
-        if session.cookies:
-            return session
+    for record in cookie_records:
+        session.cookies.set(
+            record["name"],
+            record["value"],
+            domain=record.get("domain") or ".myfitnesspal.com",
+            path=record.get("path") or "/",
+            secure=bool(record.get("secure", True)),
+        )
 
-    # Fallback to stored JSON cookies
-    stored = load_cookies()
-    if stored:
-        for name, value in stored.items():
-            session.cookies.set(name, value, domain=".myfitnesspal.com")
-        return session
-
-    raise RuntimeError(
-        "No cookies available. Export cookies from your browser to "
-        f"{NETSCAPE_COOKIES_FILE} or run refresh_browser_cookies."
-    )
+    return session
 
 
 def raw_search_foods(session: req_lib.Session, query: str, date_str: str, limit: int = 10):
@@ -513,6 +642,8 @@ def raw_delete_food_entry(
     Delete a food diary entry using the MFP web form endpoint.
     Uses Rails-style DELETE-via-POST: POST /food/remove/{entry_id}
     with _method=delete and authenticity_token.
+
+    Raises RuntimeError if the delete could not be confirmed.
     """
     # Fetch diary page for CSRF token
     diary_url = f"https://www.myfitnesspal.com/food/diary/{username}" if username else "https://www.myfitnesspal.com/food/diary"
@@ -538,10 +669,32 @@ def raw_delete_food_entry(
         },
         allow_redirects=True,
     )
-    # MFP returns 302 redirect on success
-    if r.history and r.history[0].status_code == 302:
-        return  # success
+
+    # Log response details for debugging
+    redirect_chain = [(resp.status_code, resp.headers.get("Location", "")) for resp in r.history]
+    logger.info(
+        f"Delete entry_id={entry_id}: final_status={r.status_code}, "
+        f"redirects={redirect_chain}, final_url={r.url}"
+    )
+
+    if not (r.history and r.history[0].status_code == 302):
+        logger.warning(
+            f"Delete entry_id={entry_id}: expected 302 redirect but got "
+            f"status={r.status_code}, redirects={redirect_chain}, "
+            f"response_snippet={r.text[:500]}"
+        )
+
     r.raise_for_status()
+
+    # Verify the entry was actually removed
+    post_entries = raw_get_diary_entries(session, date_str, username)
+    still_exists = any(e["entry_id"] == entry_id for e in post_entries)
+    if still_exists:
+        raise RuntimeError(
+            f"Delete appeared to succeed (status={r.status_code}, "
+            f"redirects={redirect_chain}) but entry {entry_id} is still "
+            f"present in diary. Response snippet: {r.text[:300]}"
+        )
 
 
 # ============================================================================
@@ -845,16 +998,16 @@ class SetGoalsInput(BaseModel):
     )
 
 
-class GetWaterInput(BaseModel):
-    """Input model for getting water intake."""
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    date: Optional[str] = Field(
-        default=None,
-        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    )
+# class GetWaterInput(BaseModel):
+#     """Input model for getting water intake."""
+#
+#     model_config = ConfigDict(str_strip_whitespace=True)
+#
+#     date: Optional[str] = Field(
+#         default=None,
+#         description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+#         pattern=r"^\d{4}-\d{2}-\d{2}$",
+#     )
 
 
 class GetReportInput(BaseModel):
@@ -931,196 +1084,88 @@ class DeleteFoodFromDiaryInput(BaseModel):
     )
 
 
-class SetWaterInput(BaseModel):
-    """Input model for setting water intake."""
+class RefreshCookiesInput(BaseModel):
+    """Input model for refreshing auth cookies."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    cups: float = Field(
-        ...,
-        description="Number of cups of water (e.g., 2.5 for 2.5 cups). Note: MyFitnessPal uses cups as the unit.",
-        ge=0,
-        le=50,
+    browser: str = Field(
+        default="auto",
+        description="Browser to import from: auto, brave, chrome, chromium, or firefox",
     )
-    date: Optional[str] = Field(
-        default=None,
-        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
     )
 
 
-# ============================================================================
-# Diary Entry Creation Helper Functions
-# ============================================================================
-
-
-def add_food_to_diary(
-    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
-) -> None:
-    """
-    Add a food item to the diary for a specific date and meal.
-    
-    Args:
-        client: Authenticated myfitnesspal.Client instance
-        mfp_id: MyFitnessPal food item ID
-        meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
-        target_date: Date to add the food entry
-        quantity: Number of servings (default 1.0)
-        unit: Optional unit/serving size description
-    
-    Raises:
-        RuntimeError: If the operation fails
-    """
-    from urllib import parse
-    
-    try:
-        date_str = target_date.strftime("%Y-%m-%d")
-
-        # Get the search/add page to extract CSRF token
-        search_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/search?search=food&meal=0&date={date_str}"
-        )
-        document = client._get_document_for_url(search_url)
-
-        # Extract authenticity token from the food-nutritional-details-form
-        authenticity_token = document.xpath(
-            "(//form[@id='food-nutritional-details-form']//input[@name='authenticity_token']/@value)[1]"
-        )
-        if not authenticity_token:
-            # Fallback to any authenticity token on the page
-            authenticity_token = document.xpath(
-                "(//input[@name='authenticity_token']/@value)[1]"
-            )
-        if not authenticity_token:
-            raise RuntimeError("Could not find authenticity token on search page")
-        authenticity_token = authenticity_token[0]
-
-        # Map meal names to meal indices (0=Breakfast, 1=Lunch, 2=Dinner, 3=Snacks)
-        meal_map = {
-            "breakfast": "0",
-            "lunch": "1",
-            "dinner": "2",
-            "snacks": "3",
-            "snack": "3",
-        }
-        meal_index = meal_map.get(meal.lower(), "0")
-
-        # MFP uses /food/add endpoint with food_entry[] form fields
-        add_food_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            "/food/add"
-        )
-
-        post_data = {
-            "authenticity_token": authenticity_token,
-            "food_entry[food_id]": str(mfp_id),
-            "food_entry[date]": date_str,
-            "food_entry[meal_id]": meal_index,
-            "food_entry[quantity]": str(quantity),
-        }
-
-        if unit:
-            post_data["food_entry[weight_id]"] = unit
-
-        headers = {
-            "Referer": search_url,
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-
-        response = client.session.post(add_food_url, data=post_data, headers=headers)
-        response.raise_for_status()
-
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to add food: HTTP {response.status_code}")
-
-        logger.info(f"Successfully added food {mfp_id} to {meal} for {target_date}")
-        
-    except Exception as e:
-        # Don't expose internal error details to avoid leaking sensitive information
-        error_msg = str(e)
-        # Only include safe error information
-        if "HTTP" in error_msg or "status" in error_msg.lower():
-            raise RuntimeError(f"Failed to add food to diary: {error_msg}")
-        else:
-            raise RuntimeError(f"Failed to add food to diary: {error_msg}")
-
-
-def set_water_intake(client, target_date: date, cups: float) -> None:
-    """
-    Set water intake for a specific date.
-    
-    Args:
-        client: Authenticated myfitnesspal.Client instance
-        target_date: Date to set water intake
-        cups: Number of cups of water
-    
-    Raises:
-        RuntimeError: If the operation fails
-    """
-    from urllib import parse
-    
-    try:
-        # Get the diary page for the target date to extract CSRF token
-        date_str = target_date.strftime("%Y-%m-%d")
-        diary_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}?date={date_str}"
-        )
-        
-        # Use the library's method to get the document
-        document = client._get_document_for_url(diary_url)
-        
-        # Extract authenticity token
-        authenticity_token = document.xpath(
-            "(//input[@name='authenticity_token']/@value)[1]"
-        )
-        if not authenticity_token:
-            raise RuntimeError("Could not find authenticity token on diary page")
-        authenticity_token = authenticity_token[0]
-        
-        # Build the URL for setting water
-        # MyFitnessPal uses /food/diary/{username}/water endpoint
-        water_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}/water"
-        )
-        
-        # Prepare the data for the POST request
-        post_data = {
-            "authenticity_token": authenticity_token,
-            "date": date_str,
-            "water": str(cups),
-        }
-        
-        # Set water intake
-        headers = {
-            "Referer": diary_url,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        
-        response = client.session.post(water_url, data=post_data, headers=headers)
-        response.raise_for_status()
-        
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to set water: HTTP {response.status_code}")
-        
-        logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
-        
-    except Exception as e:
-        # Don't expose internal error details to avoid leaking sensitive information
-        error_msg = str(e)
-        # Only include safe error information
-        if "HTTP" in error_msg or "status" in error_msg.lower():
-            raise RuntimeError(f"Failed to set water intake: {error_msg}")
-        else:
-            raise RuntimeError("Failed to set water intake. Please check your authentication and try again.")
+# class SetWaterInput(BaseModel):
+#     """Input model for setting water intake."""
+#
+#     model_config = ConfigDict(str_strip_whitespace=True)
+#
+#     cups: float = Field(
+#         ...,
+#         description="Number of cups of water (e.g., 2.5 for 2.5 cups). Note: MyFitnessPal uses cups as the unit.",
+#         ge=0,
+#         le=50,
+#     )
+#     date: Optional[str] = Field(
+#         default=None,
+#         description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+#         pattern=r"^\d{4}-\d{2}-\d{2}$",
+#     )
 
 
 # ============================================================================
 # MCP Tools
 # ============================================================================
+
+
+@mcp.tool(
+    name="mfp_refresh_cookies",
+    annotations={
+        "title": "Refresh Auth Cookies",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_refresh_cookies(params: RefreshCookiesInput) -> str:
+    """
+    Refresh stored MyFitnessPal cookies from Brave/Chrome/Firefox or the Netscape export file.
+    """
+    try:
+        browser = params.browser.lower()
+        preferred_browser = None if browser == "auto" else browser
+
+        cookie_records = None
+        source = None
+
+        imported, imported_browser = import_browser_cookies(preferred_browser)
+        if imported and imported_browser:
+            cookie_records = imported
+            source = f"browser:{imported_browser}"
+        else:
+            imported = import_netscape_cookies()
+            if imported:
+                cookie_records = imported
+                source = f"netscape:{NETSCAPE_COOKIES_FILE}"
+
+        if not cookie_records or not source:
+            raise RuntimeError(
+                "Could not refresh cookies from a live browser session or the Netscape export."
+            )
+
+        save_cookies(cookie_records, source=source)
+        data = summarize_cookie_records(cookie_records)
+        data["source"] = source
+
+        return format_response(data, params.response_format, "MyFitnessPal Cookie Refresh")
+
+    except Exception as e:
+        return f"Error refreshing cookies: {str(e)}"
 
 
 @mcp.tool(
@@ -1588,44 +1633,37 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
         return f"Error setting goals: {str(e)}"
 
 
-@mcp.tool(
-    name="mfp_get_water",
-    annotations={
-        "title": "Get Water Intake",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def mfp_get_water(params: GetWaterInput) -> str:
-    """
-    Get water intake for a specific date.
-
-    Returns the number of cups/glasses of water logged for the day.
-
-    Args:
-        params: GetWaterInput containing:
-            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-
-    Returns:
-        str: Water intake amount for the specified date
-    """
-    try:
-        client = get_mfp_client()
-        target_date = parse_date(params.date)
-        day = client.get_date(target_date)
-
-        data = {
-            "date": str(target_date),
-            "water_cups": day.water,
-            "water_ml": day.water * 236.588,  # Convert cups to ml
-        }
-
-        return json.dumps(data, indent=2)
-
-    except Exception as e:
-        return f"Error getting water intake: {str(e)}"
+# @mcp.tool(
+#     name="mfp_get_water",
+#     annotations={
+#         "title": "Get Water Intake",
+#         "readOnlyHint": True,
+#         "destructiveHint": False,
+#         "idempotentHint": True,
+#         "openWorldHint": True,
+#     },
+# )
+# async def mfp_get_water(params: GetWaterInput) -> str:
+#     """
+#     Get water intake for a specific date.
+#
+#     Returns the number of cups/glasses of water logged for the day.
+#     """
+#     try:
+#         client = get_mfp_client()
+#         target_date = parse_date(params.date)
+#         day = client.get_date(target_date)
+#
+#         data = {
+#             "date": str(target_date),
+#             "water_cups": day.water,
+#             "water_ml": day.water * 236.588,
+#         }
+#
+#         return json.dumps(data, indent=2)
+#
+#     except Exception as e:
+#         return f"Error getting water intake: {str(e)}"
 
 
 @mcp.tool(
@@ -1778,51 +1816,66 @@ async def mfp_delete_food_from_diary(params: DeleteFoodFromDiaryInput) -> str:
         return f"Error deleting food from diary: {str(e)}"
 
 
-@mcp.tool(
-    name="mfp_set_water",
-    annotations={
-        "title": "Log Water Intake",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def mfp_set_water(params: SetWaterInput) -> str:
-    """
-    Log water intake for a specific date.
-
-    Sets the number of cups of water consumed for the day. MyFitnessPal uses
-    cups as the unit (1 cup = ~237ml).
-
-    Args:
-        params: SetWaterInput containing:
-            - cups (float): Number of cups of water (e.g., 2.5 for 2.5 cups)
-            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-
-    Returns:
-        str: Confirmation message with the logged water amount
-    """
-    try:
-        client = get_mfp_client()
-        target_date = parse_date(params.date)
-        
-        # Set water intake
-        set_water_intake(client=client, target_date=target_date, cups=params.cups)
-        
-        return json.dumps(
-            {
-                "success": True,
-                "message": f"Successfully logged {params.cups} cups of water",
-                "date": str(target_date),
-                "cups": params.cups,
-                "milliliters": round(params.cups * 236.588, 2),
-            },
-            indent=2,
-        )
-        
-    except Exception as e:
-        return f"Error setting water intake: {str(e)}"
+# @mcp.tool(
+#     name="mfp_set_water",
+#     annotations={
+#         "title": "Log Water Intake",
+#         "readOnlyHint": False,
+#         "destructiveHint": False,
+#         "idempotentHint": False,
+#         "openWorldHint": True,
+#     },
+# )
+# async def mfp_set_water(params: SetWaterInput) -> str:
+#     """Log water intake for a specific date using raw HTML scraping."""
+#     try:
+#         session = get_raw_session()
+#         target_date = parse_date(params.date)
+#         date_str = target_date.strftime("%Y-%m-%d")
+#
+#         # Get diary page for CSRF token
+#         diary_url = "https://www.myfitnesspal.com/food/diary"
+#         r = session.get(diary_url, params={"date": date_str})
+#         r.raise_for_status()
+#         doc = lxml.html.document_fromstring(r.text)
+#
+#         tokens = doc.xpath("//input[@name='authenticity_token']/@value")
+#         if not tokens:
+#             raise RuntimeError("Could not find CSRF token on diary page")
+#
+#         # Extract username from diary page URL or meta
+#         username_el = doc.xpath("//h1[@class='main-title-2']/@data-user-name")
+#         username = username_el[0] if username_el else ""
+#
+#         water_url = f"https://www.myfitnesspal.com/food/diary/{username}/water"
+#         r = session.post(
+#             water_url,
+#             data={
+#                 "authenticity_token": tokens[0],
+#                 "date": date_str,
+#                 "water": str(params.cups),
+#             },
+#             headers={
+#                 "Referer": diary_url,
+#                 "Content-Type": "application/x-www-form-urlencoded",
+#                 "X-Requested-With": "XMLHttpRequest",
+#             },
+#         )
+#         r.raise_for_status()
+#
+#         return json.dumps(
+#             {
+#                 "success": True,
+#                 "message": f"Successfully logged {params.cups} cups of water",
+#                 "date": date_str,
+#                 "cups": params.cups,
+#                 "milliliters": round(params.cups * 236.588, 2),
+#             },
+#             indent=2,
+#         )
+#
+#     except Exception as e:
+#         return f"Error setting water intake: {str(e)}"
 
 
 @mcp.tool(
@@ -1895,88 +1948,6 @@ async def mfp_get_report(params: GetReportInput) -> str:
 
     except Exception as e:
         return f"Error getting report: {str(e)}"
-
-
-# ============================================================================
-# Cookie Management Tool
-# ============================================================================
-
-
-@mcp.tool()
-def refresh_browser_cookies(browser: str = "chrome") -> str:
-    """
-    Extract and save session cookies from your web browser.
-    
-    Use this tool when authentication fails and you need to refresh your
-    MyFitnessPal session. You must be logged into myfitnesspal.com in your
-    browser for this to work.
-    
-    Args:
-        browser: Which browser to extract cookies from ("chrome" or "firefox")
-    
-    Returns:
-        Success message or error description
-    """
-    import browser_cookie3
-    
-    try:
-        # Get browser cookie function
-        if browser.lower() == "chrome":
-            cj = browser_cookie3.chrome(domain_name='.myfitnesspal.com')
-        elif browser.lower() == "firefox":
-            cj = browser_cookie3.firefox(domain_name='.myfitnesspal.com')
-        else:
-            return f"Unsupported browser: {browser}. Use 'chrome' or 'firefox'."
-        
-        # Extract cookies to dictionary
-        cookies = {c.name: c.value for c in cj}
-        
-        # Check for session token
-        if '__Secure-next-auth.session-token' not in cookies:
-            return (
-                f"No session token found in {browser}. "
-                "Please make sure you are logged into myfitnesspal.com in your browser, "
-                "then try again."
-            )
-        
-        # Save cookies
-        save_cookies(cookies)
-        
-        # Verify they work
-        try:
-            import myfitnesspal
-            cookiejar = dict_to_cookiejar(cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            _ = client.get_date(date.today())
-            
-            return (
-                f"Successfully extracted and verified {len(cookies)} cookies from {browser}. "
-                "Authentication is now working!"
-            )
-        except Exception as e:
-            return (
-                f"Cookies were extracted from {browser} but verification failed: {e}. "
-                "The session may have expired - try logging into myfitnesspal.com again."
-            )
-            
-    except Exception as e:
-        error_msg = str(e)
-        if "Operation not permitted" in error_msg:
-            return (
-                f"Permission denied reading {browser} cookies. "
-                "This can happen due to macOS security restrictions. "
-                "Try running this command in Terminal instead:\n\n"
-                f"{COOKIES_FILE.parent}/../venv/bin/python -c \""
-                "import browser_cookie3, json, os; "
-                "from datetime import datetime; "
-                f"cj = browser_cookie3.{browser}(domain_name='.myfitnesspal.com'); "
-                "cookies = {c.name: c.value for c in cj}; "
-                "os.makedirs(os.path.expanduser('~/.mfp_mcp'), exist_ok=True); "
-                "open(os.path.expanduser('~/.mfp_mcp/cookies.json'), 'w').write("
-                "json.dumps({'cookies': cookies, 'saved_at': datetime.now().isoformat()}, indent=2)); "
-                "print('Cookies refreshed!')\""
-            )
-        return f"Error extracting cookies from {browser}: {e}"
 
 
 # ============================================================================
