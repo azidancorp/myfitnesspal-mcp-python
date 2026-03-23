@@ -541,6 +541,19 @@ def raw_add_food(
     Add a food to the MFP diary using the web form endpoint.
     Uses food_id (original_id) and serving_id (weight_id).
     """
+    meal_name = {
+        "0": "Breakfast",
+        "1": "Lunch",
+        "2": "Dinner",
+        "3": "Snacks",
+    }.get(meal_index, "Breakfast")
+    before_entries = raw_get_diary_entries(session, date_str, "")
+    before_ids = {
+        entry["entry_id"]
+        for entry in before_entries
+        if entry.get("meal") == meal_name and entry.get("entry_id")
+    }
+
     # Get CSRF token from search page
     r = session.get(
         "https://www.myfitnesspal.com/food/search",
@@ -575,10 +588,27 @@ def raw_add_food(
         },
         allow_redirects=True,
     )
-    # MFP returns 302 -> 200 on success
-    if r.history and r.history[0].status_code == 302:
-        return  # success
+    redirect_chain = [
+        (resp.status_code, resp.headers.get("Location", "")) for resp in r.history
+    ]
+    if not (r.history and r.history[0].status_code == 302):
+        raise RuntimeError(
+            "Add request did not produce the expected redirect. "
+            f"status={r.status_code} redirects={redirect_chain}"
+        )
     r.raise_for_status()
+
+    after_entries = raw_get_diary_entries(session, date_str, "")
+    after_ids = {
+        entry["entry_id"]
+        for entry in after_entries
+        if entry.get("meal") == meal_name and entry.get("entry_id")
+    }
+    if len(after_ids) <= len(before_ids):
+        raise RuntimeError(
+            "Add request returned a redirect but no new diary entry appeared. "
+            "Your cookies may be stale; refresh them and try again."
+        )
 
 
 def raw_get_diary_entries(
