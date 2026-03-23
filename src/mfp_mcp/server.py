@@ -681,10 +681,16 @@ def raw_delete_food_entry(
     r.raise_for_status()
     doc = lxml.html.document_fromstring(r.text)
 
-    tokens = doc.xpath("//input[@name='authenticity_token']/@value")
+    # Rails UJS-style deletes use the page-level CSRF token from the meta tag.
+    # Hidden form tokens on the page are not interchangeable here and can
+    # trigger a login redirect instead of a real delete.
+    tokens = doc.xpath("//meta[@name='csrf-token']/@content")
+    if not tokens:
+        tokens = doc.xpath("//input[@name='authenticity_token']/@value")
     if not tokens:
         raise RuntimeError("Could not find CSRF token on diary page")
     csrf = tokens[0]
+    referer = r.url
 
     r = session.post(
         f"https://www.myfitnesspal.com/food/remove/{entry_id}",
@@ -695,9 +701,9 @@ def raw_delete_food_entry(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Origin": "https://www.myfitnesspal.com",
-            "Referer": "https://www.myfitnesspal.com/food/diary",
+            "Referer": referer,
         },
-        allow_redirects=True,
+        allow_redirects=False,
     )
 
     # Log response details for debugging
@@ -707,14 +713,20 @@ def raw_delete_food_entry(
         f"redirects={redirect_chain}, final_url={r.url}"
     )
 
-    if not (r.history and r.history[0].status_code == 302):
+    if r.status_code != 302:
         logger.warning(
             f"Delete entry_id={entry_id}: expected 302 redirect but got "
             f"status={r.status_code}, redirects={redirect_chain}, "
             f"response_snippet={r.text[:500]}"
         )
+        r.raise_for_status()
 
-    r.raise_for_status()
+    location = r.headers.get("Location", "")
+    if "/account/login" in location:
+        raise RuntimeError(
+            "Delete request redirected to login, which usually means the "
+            "session or CSRF token was rejected. Refresh cookies and try again."
+        )
 
     # Verify the entry was actually removed
     post_entries = raw_get_diary_entries(session, date_str, username)
