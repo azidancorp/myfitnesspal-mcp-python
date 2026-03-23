@@ -274,6 +274,21 @@ pip install -e ".[dev]"
 pytest
 ```
 
+The default test suite is fully offline and uses mocked web responses.
+
+To run the optional live MyFitnessPal smoke test that performs one tiny
+add-then-delete canary cycle against your real diary:
+
+```bash
+MFP_RUN_LIVE_TESTS=1 pytest tests/test_live_web_flows.py
+```
+
+You can target a specific date instead of today if needed:
+
+```bash
+MFP_RUN_LIVE_TESTS=1 MFP_LIVE_TEST_DATE=2026-03-23 pytest tests/test_live_web_flows.py
+```
+
 ### Code Formatting
 
 ```bash
