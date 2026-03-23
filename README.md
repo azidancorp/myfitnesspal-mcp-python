@@ -470,7 +470,7 @@ Log water intake for a date.
 
 ### mfp_get_report
 Get nutrition report over a date range.
-- `report_name` (optional): "Net Calories", "Protein", "Fat", "Carbs"
+- `report_name` (optional): "All" (default, all macros), "Net Calories", "Total Calories", "Protein", "Fat", "Carbs"
 - `start_date` (optional): YYYY-MM-DD (default 7 days ago)
 - `end_date` (optional): YYYY-MM-DD (default today)
 - `response_format`: "markdown" or "json"

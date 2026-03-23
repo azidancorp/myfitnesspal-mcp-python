@@ -890,8 +890,30 @@ def build_report_from_diary(client, report_name: str, start: date, end: date) ->
         "total calories": "calories",
     }
 
-    values: OrderedDict[date, float] = OrderedDict()
+    # Key mapping for "all" report output (internal key -> display name)
+    all_display_names = {
+        "calories": "calories",
+        "protein": "protein",
+        "carbohydrates": "carbs",
+        "fat": "fat",
+    }
+
+    values: OrderedDict = OrderedDict()
     current = start
+
+    if normalized == "all":
+        while current <= end:
+            day = client.get_date(current)
+            totals = calculate_day_totals(day)
+            exercise_burn = calculate_day_exercise_burn(day)
+            day_values = {
+                all_display_names[k]: round(totals.get(k, 0.0), 1)
+                for k in all_display_names
+            }
+            day_values["net_calories"] = round(day_values["calories"] - exercise_burn, 1)
+            values[current] = day_values
+            current += timedelta(days=1)
+        return values
 
     if normalized == "net calories":
         while current <= end:
@@ -1147,8 +1169,8 @@ class GetReportInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     report_name: str = Field(
-        default="Net Calories",
-        description="Report name (e.g., 'Net Calories', 'Total Calories', 'Protein', 'Fat', 'Carbs')",
+        default="All",
+        description="Report name: 'All' (default, all macros), 'Net Calories', 'Total Calories', 'Protein', 'Fat', or 'Carbs'",
     )
     start_date: Optional[str] = Field(
         default=None,
@@ -2015,7 +2037,7 @@ async def mfp_get_report(params: GetReportInput) -> str:
 
     Args:
         params: GetReportInput containing:
-            - report_name (str): Report type (e.g., 'Net Calories', 'Protein')
+            - report_name (str): 'All' (default, all macros), 'Net Calories', 'Protein', etc.
             - start_date (str, optional): Start date, defaults to 7 days ago
             - end_date (str, optional): End date, defaults to today
             - response_format (str): 'markdown' or 'json'
@@ -2064,14 +2086,28 @@ async def mfp_get_report(params: GetReportInput) -> str:
         # Calculate summary stats
         if report:
             values = list(report.values())
-            numeric_values = [v for v in values if isinstance(v, (int, float))]
-            if numeric_values:
-                data["summary"] = {
-                    "total": sum(numeric_values),
-                    "average": round(sum(numeric_values) / len(numeric_values), 2),
-                    "min": min(numeric_values),
-                    "max": max(numeric_values),
-                }
+            if values and isinstance(values[0], dict):
+                # "All" report: per-metric summaries
+                metrics = values[0].keys()
+                data["summary"] = {}
+                for metric in metrics:
+                    metric_vals = [v[metric] for v in values if isinstance(v.get(metric), (int, float))]
+                    if metric_vals:
+                        data["summary"][metric] = {
+                            "total": round(sum(metric_vals), 1),
+                            "average": round(sum(metric_vals) / len(metric_vals), 1),
+                            "min": min(metric_vals),
+                            "max": max(metric_vals),
+                        }
+            else:
+                numeric_values = [v for v in values if isinstance(v, (int, float))]
+                if numeric_values:
+                    data["summary"] = {
+                        "total": sum(numeric_values),
+                        "average": round(sum(numeric_values) / len(numeric_values), 2),
+                        "min": min(numeric_values),
+                        "max": max(numeric_values),
+                    }
 
         return format_response(
             data, params.response_format, f"{params.report_name} Report"

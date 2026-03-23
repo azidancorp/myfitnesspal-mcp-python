@@ -118,3 +118,81 @@ def test_build_report_from_diary_supports_macro_aliases():
 
     assert carbs_report == OrderedDict([(date(2026, 3, 23), 30.0)])
     assert total_calories_report == OrderedDict([(date(2026, 3, 23), 900.0)])
+
+
+def test_build_report_all_returns_all_macros():
+    days = {
+        date(2026, 3, 21): FakeDay(
+            entries=[
+                FakeEntry({"calories": 1000.0, "protein": 90.0, "carbohydrates": 50.0, "fat": 40.0})
+            ],
+            exercises=[
+                FakeExercise(
+                    [{"nutrition_information": {"calories burned": 200.0}}]
+                )
+            ],
+        ),
+        date(2026, 3, 22): FakeDay(
+            entries=[
+                FakeEntry({"calories": 1500.0, "protein": 120.0, "carbohydrates": 100.0, "fat": 60.0})
+            ],
+            exercises=[],
+        ),
+    }
+    client = FakeClient(days)
+
+    report = server.build_report_from_diary(
+        client, "All", date(2026, 3, 21), date(2026, 3, 22)
+    )
+
+    assert report[date(2026, 3, 21)] == {
+        "calories": 1000.0,
+        "protein": 90.0,
+        "carbs": 50.0,
+        "fat": 40.0,
+        "net_calories": 800.0,
+    }
+    assert report[date(2026, 3, 22)] == {
+        "calories": 1500.0,
+        "protein": 120.0,
+        "carbs": 100.0,
+        "fat": 60.0,
+        "net_calories": 1500.0,
+    }
+
+
+def test_mfp_get_report_all_with_summary(monkeypatch):
+    days = {
+        date(2026, 3, 21): FakeDay(
+            entries=[
+                FakeEntry({"calories": 1000.0, "protein": 90.0, "carbohydrates": 50.0, "fat": 40.0})
+            ],
+            exercises=[],
+        ),
+        date(2026, 3, 22): FakeDay(
+            entries=[
+                FakeEntry({"calories": 1500.0, "protein": 120.0, "carbohydrates": 100.0, "fat": 60.0})
+            ],
+            exercises=[],
+        ),
+    }
+
+    monkeypatch.setattr(server, "get_mfp_client", lambda: FakeClient(days))
+
+    result = asyncio.run(
+        server.mfp_get_report(
+            server.GetReportInput(
+                report_name="All",
+                start_date="2026-03-21",
+                end_date="2026-03-22",
+                response_format="json",
+            )
+        )
+    )
+
+    payload = json.loads(result)
+    assert payload["source"] == "diary_fallback"
+    assert payload["values"]["2026-03-21"]["protein"] == 90.0
+    assert payload["values"]["2026-03-22"]["protein"] == 120.0
+    assert payload["summary"]["protein"]["average"] == 105.0
+    assert payload["summary"]["calories"]["total"] == 2500.0
