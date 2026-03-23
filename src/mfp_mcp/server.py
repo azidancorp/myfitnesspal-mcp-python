@@ -825,6 +825,95 @@ def ordered_dict_to_dict(od: OrderedDict) -> Dict[str, Any]:
     return {str(k): v for k, v in od.items()}
 
 
+def calculate_day_totals(day) -> Dict[str, float]:
+    """
+    Aggregate nutrition totals for a day from its entries.
+
+    Args:
+        day: MFP Day object
+
+    Returns:
+        dict: Daily nutrition totals
+    """
+    totals: Dict[str, float] = {}
+    for entry in day.entries:
+        for key, value in entry.totals.items():
+            val = float(value.magnitude) if hasattr(value, "magnitude") else float(value)
+            totals[key] = totals.get(key, 0.0) + val
+    return totals
+
+
+def calculate_day_exercise_burn(day) -> float:
+    """
+    Sum calories burned from the day's logged exercises.
+
+    Args:
+        day: MFP Day object
+
+    Returns:
+        float: Calories burned
+    """
+    total_burned = 0.0
+    for exercise in day.exercises:
+        for entry in exercise.get_as_list():
+            if "nutrition_information" in entry:
+                total_burned += float(
+                    entry["nutrition_information"].get("calories burned", 0) or 0
+                )
+    return total_burned
+
+
+def normalize_report_name(report_name: str) -> str:
+    """Normalize report names for diary-derived fallback handling."""
+    return " ".join(report_name.strip().lower().split())
+
+
+def build_report_from_diary(client, report_name: str, start: date, end: date) -> Optional[OrderedDict]:
+    """
+    Build supported nutrition reports from diary data when MFP's report endpoint fails.
+
+    Args:
+        client: Authenticated MFP client
+        report_name: Requested report name
+        start: Inclusive start date
+        end: Inclusive end date
+
+    Returns:
+        OrderedDict | None: Report values keyed by date, or None if unsupported
+    """
+    normalized = normalize_report_name(report_name)
+    nutrient_map = {
+        "protein": "protein",
+        "fat": "fat",
+        "carbs": "carbohydrates",
+        "carbohydrates": "carbohydrates",
+        "total calories": "calories",
+    }
+
+    values: OrderedDict[date, float] = OrderedDict()
+    current = start
+
+    if normalized == "net calories":
+        while current <= end:
+            day = client.get_date(current)
+            totals = calculate_day_totals(day)
+            values[current] = totals.get("calories", 0.0) - calculate_day_exercise_burn(day)
+            current += timedelta(days=1)
+        return values
+
+    nutrient_key = nutrient_map.get(normalized)
+    if not nutrient_key:
+        return None
+
+    while current <= end:
+        day = client.get_date(current)
+        totals = calculate_day_totals(day)
+        values[current] = totals.get(nutrient_key, 0.0)
+        current += timedelta(days=1)
+
+    return values
+
+
 class ResponseFormat(str, Enum):
     """Output format for tool responses."""
 
@@ -1284,12 +1373,7 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
             data["meals"][meal.name] = meal_data
 
         # Get daily totals and goals
-        totals = {}
-        for entry in day.entries:
-            for key, value in entry.totals.items():
-                val = float(value.magnitude) if hasattr(value, "magnitude") else value
-                totals[key] = totals.get(key, 0) + val
-        data["daily_totals"] = totals
+        data["daily_totals"] = calculate_day_totals(day)
         data["daily_goals"] = day.goals
 
         return format_response(
@@ -1553,15 +1637,7 @@ async def mfp_get_exercises(params: GetExercisesInput) -> str:
             data["exercises"].append(format_exercise(exercise))
 
         # Calculate total calories burned
-        total_burned = 0
-        for ex in data["exercises"]:
-            for entry in ex.get("entries", []):
-                if "nutrition_information" in entry:
-                    total_burned += entry["nutrition_information"].get(
-                        "calories burned", 0
-                    )
-
-        data["total_calories_burned"] = total_burned
+        data["total_calories_burned"] = calculate_day_exercise_burn(day)
 
         return format_response(
             data, params.response_format, f"Exercise Log for {target_date}"
@@ -1956,17 +2032,30 @@ async def mfp_get_report(params: GetReportInput) -> str:
         else:
             start = end - timedelta(days=7)
 
-        report = client.get_report(
-            report_name=params.report_name,
-            report_category="Nutrition",
-            lower_bound=start,
-            upper_bound=end,
-        )
+        source = "report_api"
+        try:
+            report = client.get_report(
+                report_name=params.report_name,
+                report_category="Nutrition",
+                lower_bound=start,
+                upper_bound=end,
+            )
+        except Exception as report_error:
+            report = build_report_from_diary(client, params.report_name, start, end)
+            if report is None:
+                raise report_error
+            source = "diary_fallback"
+            logger.warning(
+                "Falling back to diary-derived report data for %s (%s)",
+                params.report_name,
+                report_error,
+            )
 
         data = {
             "report_name": params.report_name,
             "start_date": str(start),
             "end_date": str(end),
+            "source": source,
             "values": (
                 ordered_dict_to_dict(report) if isinstance(report, OrderedDict) else report
             ),
