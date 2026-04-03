@@ -73,6 +73,19 @@ _NO_COOKIES_MSG = (
 )
 
 
+def normalize_expires(expires) -> Optional[int]:
+    """Normalize an expires value to Unix seconds. Handles ms and µs timestamps."""
+    if expires is None or expires == 0:
+        return expires
+    expires = int(expires)
+    if expires > 32503680000:       # year 3000 in seconds
+        if expires > 32503680000000:  # likely microseconds
+            expires //= 1_000_000
+        else:                         # likely milliseconds
+            expires //= 1_000
+    return expires
+
+
 def ensure_config_dir():
     """Ensure the config directory exists."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -118,7 +131,7 @@ def normalize_cookie_records(raw_cookies: Any) -> List[Dict[str, Any]]:
                 "domain": item.get("domain") or ".myfitnesspal.com",
                 "path": item.get("path") or "/",
                 "secure": bool(item.get("secure", True)),
-                "expires": (
+                "expires": normalize_expires(
                     int(expires)
                     if isinstance(expires, (int, float))
                     or (isinstance(expires, str) and expires.isdigit())
@@ -143,7 +156,7 @@ def cookiejar_to_records(cookiejar: CookieJar, source: str) -> List[Dict[str, An
                 "domain": cookie.domain,
                 "path": cookie.path or "/",
                 "secure": bool(cookie.secure),
-                "expires": cookie.expires,
+                "expires": normalize_expires(cookie.expires),
                 "discard": bool(cookie.discard),
                 "source": source,
             }
@@ -178,7 +191,8 @@ def summarize_cookie_records(
         expires = record.get("expires")
         if expires in (None, 0):
             continue
-        expires_dt = datetime.fromtimestamp(int(expires))
+        expires_norm = normalize_expires(expires)
+        expires_dt = datetime.fromtimestamp(expires_norm)
         if expires_dt <= datetime.now():
             expired.append(name)
             if name in AUTO_REFRESH_COOKIE_NAMES:
@@ -202,7 +216,7 @@ def summarize_cookie_records(
             name: {
                 "present": name in by_name,
                 "expires_at": (
-                    datetime.fromtimestamp(int(by_name[name]["expires"])).isoformat()
+                    datetime.fromtimestamp(normalize_expires(by_name[name]["expires"])).isoformat()
                     if name in by_name and by_name[name].get("expires") not in (None, 0)
                     else None
                 ),
